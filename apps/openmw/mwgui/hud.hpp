@@ -54,6 +54,7 @@ namespace MWGui
         bool getWorldMouseOver() { return mWorldMouseOver; }
 
         MyGUI::Widget* getEffectBox() { return mEffectBox; }
+        MyGUI::Widget* getMinimapBox() { return mMinimapBox; }   // majere addition (HUD layout anchors)
 
         void setEnemy(const MWWorld::Ptr& enemy);
         void resetEnemy();

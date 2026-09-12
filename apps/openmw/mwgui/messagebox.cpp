@@ -212,6 +212,19 @@ namespace MWGui
 
 
 
+    /*
+        Start of majere addition (hotbar)
+    */
+    static int sExtraBottomPadding = 0;
+
+    void MessageBoxManager::setExtraBottomPadding(int px)
+    {
+        sExtraBottomPadding = px;
+    }
+    /*
+        End of majere addition
+    */
+
     MessageBox::MessageBox(MessageBoxManager& parMessageBoxManager, const std::string& message)
       : Layout("openmw_messagebox.layout")
       , mCurrentTime(0)
@@ -220,7 +233,7 @@ namespace MWGui
       , mMessage(message)
     {
         // defines
-        mBottomPadding = 48;
+        mBottomPadding = 48 + sExtraBottomPadding;   // majere change (hotbar)
         mNextBoxPadding = 4;
 
         getWidget(mMessageWidget, "message");

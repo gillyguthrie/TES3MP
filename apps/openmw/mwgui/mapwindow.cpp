@@ -678,7 +678,9 @@ namespace MWGui
         MWWorld::CellStore* markedCell = nullptr;
         ESM::Position markedPosition;
         MWBase::Environment::get().getWorld()->getPlayer().getMarkedPosition(markedCell, markedPosition);
-        if (markedCell && markedCell->isExterior() == !mInterior
+        // majere change: a marked cell whose record is gone (seen once on a live server right after an interior->exterior
+        // move: CellStore with a null ESM::Cell) crashed here every 0.25 s frame tick; skip the marker instead
+        if (markedCell && markedCell->getCell() && markedCell->isExterior() == !mInterior
                 && (!mInterior || Misc::StringUtils::ciEqual(markedCell->getCell()->mName, mPrefix)))
         {
             MarkerUserData markerPos (mLocalMapRender);

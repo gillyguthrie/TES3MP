@@ -43,6 +43,7 @@
 #include "DedicatedPlayer.hpp"
 #include "PlayerList.hpp"
 #include "GUIController.hpp"
+#include "SessionLog.hpp"   // majere addition (session log)
 #include "CellController.hpp"
 #include "MechanicsHelper.hpp"
 #include "RecordHelper.hpp"
@@ -149,6 +150,7 @@ bool Main::init(std::vector<std::string> &content, Files::Collections &collectio
         pMain->port = atoi(address.substr(delimPos + 1).c_str());
     }
     get().mLocalSystem->serverPassword = serverPassword;
+    SessionLog::get().start(pMain->server, pMain->port);   // majere addition (session log)
 
     pMain->mNetworking->connect(pMain->server, pMain->port, content, collections);
 
@@ -173,6 +175,7 @@ bool Main::isInitialized()
 void Main::destroy()
 {
     assert(pMain);
+    SessionLog::get().end();   // majere addition (session log)
 
     delete pMain;
     pMain = 0;
@@ -181,6 +184,7 @@ void Main::destroy()
 void Main::frame(float dt)
 {
     get().getNetworking()->update();
+    SessionLog::get().update(dt);   // majere addition (session log)
 
     PlayerList::update(dt);
     get().getCellController()->updateDedicated(dt);

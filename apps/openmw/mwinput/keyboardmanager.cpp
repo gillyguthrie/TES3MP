@@ -10,6 +10,7 @@
 
 #include "../mwworld/player.hpp"
 
+
 #include "actions.hpp"
 #include "bindingsmanager.hpp"
 #include "sdlmappings.hpp"

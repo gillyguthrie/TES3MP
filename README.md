@@ -1,3 +1,46 @@
+majere's TES3MP client
+======================
+
+This is a personal fork of the TES3MP 0.8.1 client with a set of HUD additions for alchemists and gatherers,
+built on top of the unmodified upstream source below. Everything added is marked with a `majere addition` or
+`majere change` comment in the code, and every new option lives in `files/settings-default.cfg` under its own
+section (`[Hotbar]`, `[EffectDials]`, `[StatBars]`, `[Ingredients]`, `[SessionLog]`).
+
+**Visual overlay only.** Everything here reads what the game already knows and draws it on your screen. Nothing
+acts in the game world, presses a key for you, or sends anything to a server on your behalf: no packet is
+added or changed.
+
+**Still, ask before you use this on someone else's server.** Some servers forbid modified clients outright, and
+what counts as fair is the owner's call, not yours or mine. The author only uses this client where it has been
+allowed, and takes no responsibility for anyone else's use of it.
+
+What is added
+-------------
+
+* **Hotbar** with drag-and-drop item and spell slots, item and spell tooltips, a page label fed by a server's
+  "Quick Key Page: N" message, and a gold flash on use.
+* **Effect strip**: the active effects as small dials with a soft clock sweep, a Sun Damage column that only
+  shows in daylight, and the constant-effect (Azura's Star) indicator with a two-column popup.
+* **Resistances**: a collapsible 3x2 grid of fire, frost, shock, magicka, poison and paralysis.
+* **Stat bars** for health, magicka and fatigue beside the hotbar, with +/- signs for anything draining or
+  restoring them per second and tooltips naming the sources.
+* **Ingredient finder**: a mortar-and-pestle icon opens a picker that searches every ingredient record by name
+  or effect, tiled as icons with effect tooltips and a colour code by effect category; up to three are tracked.
+  A coin icon lists the shops in town that restock them and any seller standing nearby; an alchemy icon unfolds
+  into a 3x3 map of the surrounding cells with the count of tracked plants per cell, shop markers and a facing
+  arrow.
+* **Session log**: a per-session plain-text log of chat, server messages and the player's vitals (read-only).
+
+Building
+--------
+
+Build it like upstream TES3MP 0.8.1 (see below); nothing new is required. Windows / MSVC 2019 is what the
+author builds with. The new textures under `files/vfs/textures` are installed with the rest of the resources.
+
+Upstream README follows.
+
+---
+
 TES3MP
 ======
 

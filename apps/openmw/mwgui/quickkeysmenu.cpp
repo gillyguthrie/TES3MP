@@ -131,6 +131,7 @@ namespace MWGui
 
     void QuickKeysMenu::unassign(keyData* key)
     {
+        ++mRevision;   // majere addition (hotbar)
         key->button->clearUserStrings();
         key->button->setItem(MWWorld::Ptr());
 
@@ -221,6 +222,24 @@ namespace MWGui
         mAssignDialog->setVisible(true);
     }
 
+    /*
+        Start of majere addition (hotbar drag & drop)
+    */
+    void QuickKeysMenu::openAssignDialogForSlot(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(mKey.size()))
+            return;
+        mSelected = &mKey[index];
+        if (mSelected->index == 10)   // hand-to-hand slot is fixed
+            return;
+        if (!mAssignDialog)
+            mAssignDialog = new QuickKeysMenuAssign(this);
+        mAssignDialog->setVisible(true);
+    }
+    /*
+        End of majere addition
+    */
+
     void QuickKeysMenu::onOkButtonClicked (MyGUI::Widget *sender)
     {
         MWBase::Environment::get().getWindowManager()->removeGuiMode(GM_QuickKeysMenu);
@@ -270,6 +289,7 @@ namespace MWGui
         while (mSelected->button->getChildCount()) // Destroy number label
             MyGUI::Gui::getInstance().destroyWidget(mSelected->button->getChildAt(0));
 
+        ++mRevision;   // majere addition (hotbar)
         mSelected->type = Type_Item;
         mSelected->id = item.getCellRef().getRefId();
         mSelected->name = item.getClass().getName(item);
@@ -306,6 +326,7 @@ namespace MWGui
         while (mSelected->button->getChildCount()) // Destroy number label
             MyGUI::Gui::getInstance().destroyWidget(mSelected->button->getChildAt(0));
 
+        ++mRevision;   // majere addition (hotbar)
         mSelected->type = Type_MagicItem;
         mSelected->id = item.getCellRef().getRefId();
         mSelected->name = item.getClass().getName(item);
@@ -345,6 +366,7 @@ namespace MWGui
         const MWWorld::ESMStore &esmStore = MWBase::Environment::get().getWorld()->getStore();
         const ESM::Spell* spell = esmStore.get<ESM::Spell>().find(spellId);
 
+        ++mRevision;   // majere addition (hotbar)
         mSelected->type = Type_Magic;
         mSelected->id = spellId;
         mSelected->name = spell->mName;

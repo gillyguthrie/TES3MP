@@ -71,8 +71,26 @@ namespace MWGui
             End of tes3mp addition
         */
 
+        /*
+            Start of majere addition (hotbar)
+
+            Read-only view of the slot table plus a revision counter that ticks on every
+            assign/unassign, so the hotbar can redraw only when something changed.
+        */
+        /// Open the game's own item/magic/unassign dialog for slot index (0-based); no-op for the hand-to-hand slot
+        void openAssignDialogForSlot(int index);
+        unsigned int getRevision() const { return mRevision; }
+        int getSlotCount() const { return static_cast<int>(mKey.size()); }
+        QuickKeyType getSlotType(int i) const { return mKey[i].type; }
+        const std::string& getSlotId(int i) const { return mKey[i].id; }
+        const std::string& getSlotName(int i) const { return mKey[i].name; }
+        /*
+            End of majere addition
+        */
 
     private:
+        unsigned int mRevision = 0;   // majere addition (hotbar)
+
 
         struct keyData {
             int index;

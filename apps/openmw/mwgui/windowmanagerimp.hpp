@@ -92,6 +92,10 @@ namespace MWGui
 {
   class WindowBase;
   class HUD;
+  class Hotbar;   // majere addition (hotbar)
+  class EffectDials;   // majere addition (effect dials)
+  class StatBars;   // majere addition (stat bars)
+  class Ingredients;   // majere addition (ingredient finder)
   class MapWindow;
   class MainMenu;
   class StatsWindow;
@@ -305,6 +309,7 @@ namespace MWGui
         Make it possible to add quickKeys from elsewhere in the code
     */
     virtual void setQuickKey(int slot, int quickKeyType, MWWorld::Ptr item, const std::string& spellId = "");
+    void setQuickKeyPage(int page) override;   // majere addition (hotbar)
     /*
         End of tes3mp addition
     */
@@ -507,6 +512,10 @@ namespace MWGui
     CustomMarkerCollection mCustomMarkers;
 
     HUD *mHud;
+    Hotbar *mHotbar;   // majere addition (hotbar)
+    EffectDials *mEffectDials;   // majere addition (effect dials)
+    StatBars *mStatBars;   // majere addition (stat bars)
+    Ingredients *mIngredients;   // majere addition (ingredient finder)
     MapWindow *mMap;
     MWRender::LocalMap* mLocalMapRender;
     ToolTips *mToolTips;

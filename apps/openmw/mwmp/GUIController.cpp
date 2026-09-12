@@ -26,6 +26,7 @@
 #include "../mwworld/cellstore.hpp"
 
 #include "GUIController.hpp"
+#include "SessionLog.hpp"   // majere addition (session log)
 #include "Main.hpp"
 #include "Networking.hpp"
 #include "GUI/PlayerMarkerCollection.hpp"
@@ -84,6 +85,7 @@ void mwmp::GUIController::setupChat()
 
 void mwmp::GUIController::printChatMessage(std::string &msg)
 {
+    SessionLog::get().chat(msg);   // majere addition (session log)
     if (mChat != nullptr)
         mChat->print(msg);
 }
@@ -130,6 +132,25 @@ void mwmp::GUIController::showMessageBox(const BasePlayer::GUIMessageBox &guiMes
 {
     MWBase::WindowManager *windowManager = MWBase::Environment::get().getWindowManager();
     windowManager->messageBox(guiMessageBox.label);
+    SessionLog::get().message("MessageBox", guiMessageBox.label);   // majere addition (session log)
+
+    /*
+        Start of majere addition (hotbar)
+
+        A server script may announce page switches with a message box "Quick Key Page: N"; feed N to the hotbar.
+    */
+    static const std::string pagePrefix = "quick key page:";
+    std::string lowered = guiMessageBox.label;
+    for (char &ch : lowered) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    if (lowered.compare(0, pagePrefix.size(), pagePrefix) == 0)
+    {
+        int page = atoi(guiMessageBox.label.c_str() + pagePrefix.size());
+        if (page > 0)
+            windowManager->setQuickKeyPage(page);
+    }
+    /*
+        End of majere addition
+    */
 }
 
 std::vector<std::string> splitString(const std::string &str, char delim = ';')
@@ -147,11 +168,14 @@ void mwmp::GUIController::showCustomMessageBox(const BasePlayer::GUIMessageBox &
     MWBase::WindowManager* windowManager = MWBase::Environment::get().getWindowManager();
     std::vector<std::string> buttons = splitString(guiMessageBox.buttons);
     windowManager->interactiveMessageBox(guiMessageBox.label, buttons, false, true);
+    SessionLog::get().message("CustomMessageBox", guiMessageBox.label + " [" + guiMessageBox.buttons + "]");   // majere addition
 }
 
 void mwmp::GUIController::showInputBox(const BasePlayer::GUIMessageBox &guiMessageBox)
 {
     MWBase::WindowManager *windowManager = MWBase::Environment::get().getWindowManager();
+    SessionLog::get().message(guiMessageBox.type == BasePlayer::GUIMessageBox::PasswordDialog ? "PasswordDialog" : "InputDialog",
+                              guiMessageBox.label);   // majere addition (session log; never the entered text)
 
     windowManager->removeDialog(mInputBox);
     windowManager->pushGuiMode((MWGui::GuiMode)GM_TES3MP_InputBox);

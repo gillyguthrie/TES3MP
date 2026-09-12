@@ -276,6 +276,16 @@ namespace MWBase
                 End of tes3mp addition
             */
 
+            /*
+                Start of majere addition (hotbar)
+
+                Server-reported quick-key page number for the hotbar's page indicator (0 = unknown/hide)
+            */
+            virtual void setQuickKeyPage(int page) = 0;
+            /*
+                End of majere addition
+            */
+
             virtual std::string getSelectedSpell() = 0;
             virtual void setSelectedSpell(const std::string& spellId, int successChancePercent) = 0;
             virtual void setSelectedEnchantItem(const MWWorld::Ptr& item) = 0;

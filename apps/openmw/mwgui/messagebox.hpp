@@ -25,6 +25,16 @@ namespace MWGui
             void onFrame (float frameDuration);
             void createMessageBox (const std::string& message, bool stat = false);
             void removeStaticMessageBox ();
+
+            /*
+                Start of majere addition (hotbar)
+
+                Extra bottom padding so message boxes stack above the hotbar strip
+            */
+            static void setExtraBottomPadding(int px);
+            /*
+                End of majere addition
+            */
             /*
                 Start of tes3mp change (major)
 

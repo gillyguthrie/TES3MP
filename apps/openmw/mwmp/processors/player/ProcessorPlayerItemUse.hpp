@@ -39,7 +39,19 @@ namespace mwmp
 
                 if (itemPtr)
                 {
-                    MWBase::Environment::get().getWindowManager()->getInventoryWindow()->useItem(itemPtr);
+                    /*
+                        Start of majere change (hotbar / scrolls)
+
+                        Stock OpenMW only "uses" (equips) a quick-key magic item if it has an equipment slot;
+                        an enchanted scroll has none and is merely selected as the active enchantment.
+                        Running the generic use action on a scroll opens it for reading instead, so skip it.
+                    */
+                    bool equippable = !itemPtr.getClass().getEquipmentSlots(itemPtr).first.empty();
+                    if (!player->usingItemMagic || equippable)
+                        MWBase::Environment::get().getWindowManager()->getInventoryWindow()->useItem(itemPtr);
+                    /*
+                        End of majere change
+                    */
 
                     if (player->usingItemMagic)
                     {

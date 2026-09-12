@@ -331,6 +331,9 @@ namespace MWGui
         {
             position.top = MyGUI::InputManager::getInstance().getMousePosition().top - size.height - 8;
         }
+        // majere change: a tooltip taller than the space above the cursor used to run off the top of the screen
+        if (position.top < 0)
+            position.top = 0;
     }
 
     void ToolTips::clear()

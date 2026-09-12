@@ -172,6 +172,21 @@
         </Widget>
     </Resource>
 
+    <!-- majere addition (hotbar): MW_ItemIconBox with the icon scaled to fill the interior, no drop shadow -->
+    <Resource type="ResourceLayout" name="MW_ItemIconHotbar" version="3.2.0">
+        <Widget type="Widget" skin="" position="0 0 50 50" name="Root">
+            <Widget type="ImageBox" skin="ImageBox" position="3 3 44 44" align="Stretch" name="Frame">
+                <Widget type="ImageBox" skin="ImageBox" position="0 0 44 44" align="Stretch" name="Item"/>
+                <Widget type="TextBox" skin="CountText" position="6 24 36 18" align="Right Bottom" name="Text">
+                    <Property key="TextAlign" value="Right"/>
+                    <Property key="TextShadow" value="true"/>
+                </Widget>
+            </Widget>
+
+            <Widget type="Widget" skin="MW_Box_Overlay" position="0 0 50 50" align="Stretch"/>
+        </Widget>
+    </Resource>
+
     <!-- Same as MW_Caption, but reserves some free space on the right for the Pin button -
        i.e. not allowing the caption label to stretch there, but still showing the tiling background. -->
     <Resource type="ResourceLayout" name="MW_Caption_Pin" version="3.2.0">

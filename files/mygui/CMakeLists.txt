@@ -99,6 +99,8 @@ set(MYGUI_FILES
     skins.xml
 
     tes3mp_login.layout
+    openmw_hotbar.layout
+    openmw_effectdials.layout
     tes3mp_login.skin.xml
     tes3mp_dialog_list.layout
     tes3mp_chat.layout

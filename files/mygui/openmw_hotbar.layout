@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- majere addition (hotbar): slot widgets are created in code (hotbar.cpp) so size/spacing come from settings.cfg [Hotbar] -->
+<MyGUI type="Layout">
+    <Widget type="Widget" layer="Menu" position="0 0 300 200" name="_Main" align="Left Top">
+        <Widget type="Widget" skin="" position="0 0 500 50" align="Left Top" name="Row"/>
+        <Widget type="TextBox" skin="SandText" position="0 0 140 20" align="Left Top" name="PageText">
+            <Property key="TextAlign" value="Left VCenter"/>
+            <Property key="TextShadow" value="true"/>
+        </Widget>
+    </Widget>
+</MyGUI>

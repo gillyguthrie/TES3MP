@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- majere addition (effect dials): two top-right boxes; dials are created in code (effectdials.cpp) -->
+<MyGUI type="Layout">
+    <Widget type="Widget" layer="HUD" position="0 0 300 200" name="_Main" align="Stretch">
+        <Widget type="Widget" skin="HUD_Box" position="0 0 80 70" align="Left Top" name="PotionBox">
+            <Widget type="TextBox" skin="SandBrightText" position="5 3 70 16" align="Left Top" name="PotionCaption">
+                <Property key="Caption" value="Potions"/>
+                <Property key="TextAlign" value="Center"/>
+                <Property key="TextShadow" value="true"/>
+            </Widget>
+        </Widget>
+        <Widget type="Widget" skin="" position="0 200 70 120" align="Left Top" name="ResistBox"/>
+        <Widget type="Widget" skin="HUD_Box" position="0 80 80 70" align="Left Top" name="EffectBox">
+            <Widget type="TextBox" skin="SandBrightText" position="5 3 70 16" align="Left Top" name="EffectCaption">
+                <Property key="Caption" value="Effects"/>
+                <Property key="TextAlign" value="Center"/>
+                <Property key="TextShadow" value="true"/>
+            </Widget>
+        </Widget>
+    </Widget>
+</MyGUI>

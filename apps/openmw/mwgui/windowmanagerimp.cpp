@@ -92,6 +92,11 @@
 #include "scrollwindow.hpp"
 #include "bookwindow.hpp"
 #include "hud.hpp"
+#include "hotbar.hpp"   // majere addition (hotbar)
+#include "effectdials.hpp"   // majere addition (effect dials)
+#include "statbars.hpp"   // majere addition (stat bars)
+#include "ingredients.hpp"   // majere addition (ingredient finder)
+#include "../mwmp/SessionLog.hpp"   // majere addition (session log)
 #include "mainmenu.hpp"
 #include "countdialog.hpp"
 #include "tradewindow.hpp"
@@ -182,6 +187,10 @@ namespace MWGui
       , mHitFaderEnabled(Settings::Manager::getBool ("hit fader", "GUI"))
       , mWerewolfOverlayEnabled(Settings::Manager::getBool ("werewolf overlay", "GUI"))
       , mHudEnabled(true)
+      , mHotbar(nullptr)   // majere addition (hotbar)
+      , mEffectDials(nullptr)   // majere addition (effect dials)
+      , mStatBars(nullptr)   // majere addition (stat bars)
+      , mIngredients(nullptr)   // majere addition (ingredient finder)
       , mCursorVisible(true)
       , mCursorActive(true)
       , mPlayerBounty(-1)
@@ -330,7 +339,18 @@ namespace MWGui
         mWindows.push_back(mSpellWindow);
         trackWindow(mSpellWindow, "spells");
 
-        mGuiModeStates[GM_Inventory] = GuiModeState({mMap, mInventoryWindow, mSpellWindow, mStatsWindow});
+        /*
+            Start of majere change: [Windows] hide map in menu = true keeps the map window out of the inventory menu
+        */
+        bool hideMapInMenu = false;
+        try { hideMapInMenu = Settings::Manager::getBool("hide map in menu", "Windows"); } catch (...) {}
+        if (hideMapInMenu)
+            mGuiModeStates[GM_Inventory] = GuiModeState({mInventoryWindow, mSpellWindow, mStatsWindow});
+        else
+            mGuiModeStates[GM_Inventory] = GuiModeState({mMap, mInventoryWindow, mSpellWindow, mStatsWindow});
+        /*
+            End of majere change
+        */
         mGuiModeStates[GM_None] = GuiModeState({mMap, mInventoryWindow, mSpellWindow, mStatsWindow});
 
         mTradeWindow = new TradeWindow();
@@ -412,6 +432,15 @@ namespace MWGui
         mGuiModeStates[GM_Alchemy] = GuiModeState(alchemyWindow);
 
         mQuickKeysMenu = new QuickKeysMenu();
+        // majere addition (hotbar): persistent HUD strip mirroring the quick keys; lives in mWindows like mHud
+        mHotbar = new Hotbar(mQuickKeysMenu, mDragAndDrop);
+        mWindows.push_back(mHotbar);
+        mMessageBoxManager->setExtraBottomPadding(mHotbar->getMessageBoxLift());   // majere addition (hotbar)
+        mEffectDials = new EffectDials();   // majere addition (effect dials)
+        mWindows.push_back(mEffectDials);
+        mEffectDials->setAnchors(mHud, mHotbar);   // majere addition (layout anchors)
+        mStatBars = new StatBars(mHotbar);   // majere addition (stat bars); not a WindowBase, deleted in the destructor
+        mIngredients = new Ingredients(mHotbar);   // majere addition (ingredient finder); same
         mWindows.push_back(mQuickKeysMenu);
         mGuiModeStates[GM_QuickKeysMenu] = GuiModeState(mQuickKeysMenu);
 
@@ -535,6 +564,8 @@ namespace MWGui
                 delete window;
             mWindows.clear();
 
+            delete mStatBars;   // majere addition (stat bars)
+            delete mIngredients;   // majere addition (ingredient finder)
             delete mMessageBoxManager;
             delete mLocalMapRender;
             delete mCharGen;
@@ -614,6 +645,10 @@ namespace MWGui
             return; // UI not created yet
 
         mHud->setVisible(mHudEnabled && !loading);
+        mHotbar->setVisible(mHudEnabled && !loading && mHotbar->isEnabled());   // majere addition (hotbar)
+        mEffectDials->setVisible(mHudEnabled && !loading && mEffectDials->isEnabled());   // majere addition (effect dials)
+        mStatBars->setVisible(mHudEnabled && !loading);   // majere addition (stat bars)
+        mIngredients->setVisible(mHudEnabled && !loading);   // majere addition (ingredient finder)
         mToolTips->setVisible(mHudEnabled && !loading);
 
         bool gameMode = !isGuiMode();
@@ -931,6 +966,10 @@ namespace MWGui
         mDragAndDrop->onFrame();
 
         mHud->onFrame(frameDuration);
+        mHotbar->onFrame(frameDuration);   // majere addition (hotbar)
+        mEffectDials->onFrame(frameDuration);   // majere addition (effect dials)
+        mStatBars->onFrame(frameDuration);   // majere addition (stat bars)
+        mIngredients->onFrame(frameDuration);   // majere addition (ingredient finder)
 
         mDebugWindow->onFrame(frameDuration);
 
@@ -1601,9 +1640,24 @@ namespace MWGui
         mQuickKeysMenu->updateActivatedQuickKey();
     }
 
+    /*
+        Start of majere addition (hotbar)
+    */
+    void WindowManager::setQuickKeyPage(int page)
+    {
+        if (mHotbar)
+            mHotbar->setPage(page);
+    }
+    /*
+        End of majere addition
+    */
+
     void WindowManager::activateQuickKey (int index)
     {
         mQuickKeysMenu->activateQuickKey(index);
+        mHotbar->flashSlot(index);   // majere addition (hotbar)
+        if (index >= 1 && index <= mQuickKeysMenu->getSlotCount())   // majere addition (session log)
+            mwmp::SessionLog::get().quickKey(index, mQuickKeysMenu->getSlotName(index - 1).empty() ? std::string("(empty)") : mQuickKeysMenu->getSlotName(index - 1));
     }
 
     /*

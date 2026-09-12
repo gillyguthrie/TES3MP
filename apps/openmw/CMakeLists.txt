@@ -41,7 +41,7 @@ add_openmw_dir (mwgui
     itemmodel containeritemmodel inventoryitemmodel sortfilteritemmodel itemview
     tradeitemmodel companionitemmodel pickpocketitemmodel controllers savegamedialog
     recharge mode videowidget backgroundimage itemwidget screenfader debugwindow spellmodel spellview
-    draganddrop timeadvancer jailscreen itemchargeview keyboardnavigation textcolours statswatcher
+    draganddrop timeadvancer jailscreen itemchargeview keyboardnavigation textcolours statswatcher hotbar effectdials statbars ingredients ingredientdata
     )
 
 add_openmw_dir (mwdialogue
@@ -99,7 +99,7 @@ add_openmw_dir (mwbase
     inputmanager windowmanager statemanager
     )
 
-add_openmw_dir (mwmp Main Networking LocalSystem LocalPlayer DedicatedPlayer PlayerList LocalActor DedicatedActor ActorList
+add_openmw_dir (mwmp Main Networking LocalSystem LocalPlayer DedicatedPlayer PlayerList LocalActor DedicatedActor ActorList SessionLog
     ObjectList Worldstate Cell CellController GUIController MechanicsHelper RecordHelper ScriptController
     )
 
