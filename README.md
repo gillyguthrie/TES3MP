@@ -1,4 +1,4 @@
-majere's TES3MP client
+Majere's TES3MP client
 ======================
 
 This is a personal fork of the TES3MP 0.8.1 client with a set of HUD additions for alchemists and gatherers,
