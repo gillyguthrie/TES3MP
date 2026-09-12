@@ -14,6 +14,13 @@ added or changed.
 what counts as fair is the owner's call, not yours or mine. The author only uses this client where it has been
 allowed, and takes no responsibility for anyone else's use of it.
 
+Showcase
+--------
+
+Eighty seconds of the overlays in play, captions included:
+
+https://github.com/user-attachments/assets/349edf18-71a2-4c88-9fa9-12c5228ffe12
+
 What is added
 -------------
 
