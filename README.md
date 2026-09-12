@@ -38,6 +38,15 @@ What is added
   arrow.
 * **Session log**: a per-session plain-text log of chat, server messages and the player's vitals (read-only).
 
+Download
+--------
+
+You do not need to build anything. The [Releases page](https://github.com/gillyguthrie/TES3MP/releases) has
+a zip with the client, the runtime libraries it was built against and the resources it needs. Have the
+official TES3MP 0.8.1 for Windows installed and run once, copy that folder to a new one, unzip the release
+into the copy, and start `tes3mp.exe` from there. Your existing server list, name and settings carry over.
+The full steps are in `INSTALL.txt` inside the zip.
+
 Building
 --------
 
