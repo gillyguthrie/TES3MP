@@ -18,6 +18,7 @@
 */
 #include "../mwmp/Main.hpp"
 #include "../mwmp/GUIController.hpp"
+#include "ingredients.hpp"   // majere addition (gold coin on the doors of tracked shops)
 /*
     End of tes3mp addition
 */
@@ -177,6 +178,7 @@ namespace MWGui
         , mChanged(true)
         , mFogOfWarToggled(true)
         , mFogOfWarEnabled(fogOfWarEnabled)
+        , mPlantDotsVersion(0)   // majere addition
         , mMapWidgetSize(0)
         , mNumCells(0)
         , mCellDistance(0)
@@ -537,6 +539,15 @@ namespace MWGui
         {
             mMarkerUpdateTimer = 0;
             updateMagicMarkers();
+            // majere addition: the tracked set changed -> the door coins are redone next frame
+            if (Ingredients::plantDotsVersion() != mPlantDotsVersion)
+                updatePlantDots();
+            const std::string& shopSignature = Ingredients::trackedSignature();
+            if (shopSignature != mShopSignature)
+            {
+                mShopSignature = shopSignature;
+                mNeedDoorMarkersUpdate = true;
+            }
         }
 
         updateRequiredMaps();
@@ -602,8 +613,34 @@ namespace MWGui
             redraw();
     }
 
+    // majere addition: one small tinted dot per tracked plant, above the fog, never in the mouse's way
+    void LocalMapBase::updatePlantDots()
+    {
+        mPlantDotsVersion = Ingredients::plantDotsVersion();
+        for (MyGUI::Widget* widget : mPlantDotWidgets)
+            MyGUI::Gui::getInstance().destroyWidget(widget);
+        mPlantDotWidgets.clear();
+        const std::vector<Ingredients::PlantDot>& dots = Ingredients::plantDots();
+        for (const Ingredients::PlantDot& dot : dots)
+        {
+            MarkerUserData data(mLocalMapRender);
+            const MyGUI::IntPoint pos = getMarkerPosition(dot.x, dot.y, data);
+            MyGUI::ImageBox* w = mLocalMap->createWidget<MyGUI::ImageBox>("ImageBox",
+                MyGUI::IntCoord(pos.left - 4, pos.top - 4, 8, 8), MyGUI::Align::Default);
+            w->setImageTexture("textures\\majere_dot.png");
+            w->setColour(dot.colour);
+            w->setDepth(Local_MarkerAboveFogLayer);
+            w->setNeedMouseFocus(false);
+            mPlantDotWidgets.push_back(w);
+        }
+        if (!dots.empty() || !mPlantDotWidgets.empty())
+            redraw();
+    }
+
     void LocalMapBase::updateDoorMarkers()
     {
+        mPlantDotsVersion = 0;   // the map moved to another cell: the dots are placed afresh at the next tick
+
         // clear all previous door markers
         for (MyGUI::Widget* widget : mDoorMarkerWidgets)
             MyGUI::Gui::getInstance().destroyWidget(widget);
@@ -639,6 +676,18 @@ namespace MWGui
             for (CustomMarkerCollection::ContainerType::const_iterator iter = markers.first; iter != markers.second; ++iter)
                 destNotes.push_back(iter->second.mNote);
 
+            /*
+                Start of majere addition: a door into a shop that sells a tracked ingredient says so in its
+                tooltip ("Saltrice (20): keeper") and wears a gold coin
+            */
+            std::vector<std::string> shopLines;
+            if (!marker.dest.mPaged)
+                shopLines = Ingredients::shopLines(marker.dest.mWorldspace);
+            destNotes.insert(destNotes.end(), shopLines.begin(), shopLines.end());
+            /*
+                End of majere addition
+            */
+
             MarkerUserData data (mLocalMapRender);
             data.notes = destNotes;
             data.caption = marker.name;
@@ -660,6 +709,18 @@ namespace MWGui
             doorMarkerCreated(markerWidget);
 
             mDoorMarkerWidgets.push_back(markerWidget);
+
+            // majere addition: the coin, over the door square, under the fog like the square itself; the square
+            // keeps the mouse (its tooltip names the shop, the keeper and the stock)
+            if (!shopLines.empty())
+            {
+                MyGUI::ImageBox* coin = mLocalMap->createWidget<MyGUI::ImageBox>("ImageBox",
+                    MyGUI::IntCoord(widgetPos.left - 7, widgetPos.top - 7, 14, 14), MyGUI::Align::Default);
+                coin->setImageTexture("icons\\m\\tx_gold_001.dds");
+                coin->setDepth(Local_MarkerLayer);
+                coin->setNeedMouseFocus(false);
+                mDoorMarkerWidgets.push_back(coin);
+            }
         }
     }
 
@@ -747,6 +808,20 @@ namespace MWGui
         getWidget(mButton, "WorldButton");
         mButton->eventMouseButtonClick += MyGUI::newDelegate(this, &MapWindow::onWorldButtonClicked);
         mButton->setCaptionWithReplacing( mGlobal ? "#{sLocal}" : "#{sWorld}");
+
+        // majere addition: other players' markers on/off
+        getWidget(mPlayersButton, "PlayersButton");
+        mPlayersButton->eventMouseButtonClick += MyGUI::newDelegate(this, &MapWindow::onPlayersButtonClicked);
+        mPlayersButton->setUserString("ToolTipType", "Layout");
+        mPlayersButton->setUserString("ToolTipLayout", "TextToolTip");
+        mPlayersButton->setUserString("Caption_Text", "Other players' markers on the local map: on or off (remembered)");
+        updatePlayersButton();
+        getWidget(mPlantsButton, "PlantsButton");
+        mPlantsButton->eventMouseButtonClick += MyGUI::newDelegate(this, &MapWindow::onPlantsButtonClicked);
+        mPlantsButton->setUserString("ToolTipType", "Layout");
+        mPlantsButton->setUserString("ToolTipLayout", "TextToolTip");
+        mPlantsButton->setUserString("Caption_Text", "Tracked plants on the local map and in the cell grid (remembered):\ndynamic = what still stands, static = every placement, off = no dots");
+        mPlantsButton->setCaption(Ingredients::plantsModeLabel());
 
         getWidget(mEventBoxGlobal, "EventBoxGlobal");
         mEventBoxGlobal->eventMouseDrag += MyGUI::newDelegate(this, &MapWindow::onMouseDrag);
@@ -860,6 +935,13 @@ namespace MWGui
     {
         WindowBase::setVisible(visible);
         mButton->setVisible(visible && MWBase::Environment::get().getWindowManager()->getMode() != MWGui::GM_None);
+        mPlayersButton->setVisible(visible && MWBase::Environment::get().getWindowManager()->getMode() != MWGui::GM_None);   // majere addition
+        mPlantsButton->setVisible(mPlayersButton->getVisible());
+        if (visible)
+        {
+            updatePlayersButton();   // the remembered state is read after this window is built
+            mPlantsButton->setCaption(Ingredients::plantsModeLabel());
+        }
     }
 
     void MapWindow::renderGlobalMap()
@@ -997,6 +1079,25 @@ namespace MWGui
             mGlobalMap->setViewOffset( mGlobalMap->getViewOffset() + diff );
 
         mLastDragPos = MyGUI::IntPoint(_left, _top);
+    }
+
+    void MapWindow::onPlayersButtonClicked(MyGUI::Widget* /*_sender*/)
+    {
+        mwmp::GUIController* gui = mwmp::Main::get().getGUIController();
+        gui->setPlayerMarkersShown(!gui->playerMarkersShown());
+        updatePlayersButton();
+    }
+
+    void MapWindow::onPlantsButtonClicked(MyGUI::Widget* /*_sender*/)
+    {
+        Ingredients::cyclePlantsMode();
+        mPlantsButton->setCaption(Ingredients::plantsModeLabel());
+    }
+
+    void MapWindow::updatePlayersButton()
+    {
+        const bool shown = mwmp::Main::get().getGUIController()->playerMarkersShown();
+        mPlayersButton->setCaption(shown ? "Players: on" : "Players: off");
     }
 
     void MapWindow::onWorldButtonClicked(MyGUI::Widget* _sender)

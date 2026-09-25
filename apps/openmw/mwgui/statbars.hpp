@@ -47,7 +47,8 @@ namespace MWGui
         /// per-second effects only: Damage/Poison/elemental/Absorb (never Drain) vs Restore (never Fortify)
         void updateSigns(Bar& b, const MWMechanics::MagicEffects& effects, const int* damageIds, int nDamage, int restoreId, bool sunDamage);
         /// tooltip text for a sign: every source of the given effects on the player, one per line
-        void updateSignTooltips(Bar& b, const int* damageIds, int nDamage, int restoreId);
+        void updateSignTooltips(Bar& b, const int* damageIds, int nDamage, int restoreId, float sunPerSecond = 0.f);
+        float mSunPerSecond;    // vampire sun damage actually ticking right now (outside, daylight, weather-scaled)
         float mTooltipTimer;
 
         bool mEnabled;

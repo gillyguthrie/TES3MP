@@ -160,3 +160,20 @@ void PlayerList::clearHitAttemptActorId(int actorId)
             playerCreatureStats.setHitAttemptActorId(-1);
     }
 }
+
+/*
+    majere addition: the map window's Players button
+*/
+void PlayerList::setMarkersShown(bool shown)
+{
+    for (auto &playerEntry : playerList)
+    {
+        DedicatedPlayer *player = playerEntry.second;
+        if (!player)
+            continue;
+        if (shown)
+            player->enableMarker();
+        else
+            player->removeMarker();
+    }
+}

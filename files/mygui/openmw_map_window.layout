@@ -28,6 +28,18 @@
             <Widget type="Button" skin="" position_real="0 0 1 1" name="EventBoxGlobal" align="Stretch"/>
         </Widget>
 
+        <!-- majere addition: other players' markers on/off, remembered in [Map] show player markers -->
+        <Widget type="AutoSizedButton" skin="MW_Button" position="10 233 90 22" align="Bottom Left" name="PlayersButton">
+            <Property key="ExpandDirection" value="Right"/>
+            <Property key="NeedKey" value="false"/>
+        </Widget>
+
+        <!-- majere addition: tracked-plant dots on/off, stacked above the Players button -->
+        <Widget type="AutoSizedButton" skin="MW_Button" position="10 207 90 22" align="Bottom Left" name="PlantsButton">
+            <Property key="ExpandDirection" value="Right"/>
+            <Property key="NeedKey" value="false"/>
+        </Widget>
+
         <!-- World button -->
         <Widget type="AutoSizedButton" skin="MW_Button" position="213 233 61 22" align="Bottom Right" name="WorldButton">
             <Property key="ExpandDirection" value="Left"/>

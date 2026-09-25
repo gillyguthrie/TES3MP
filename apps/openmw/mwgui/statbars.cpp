@@ -55,7 +55,7 @@ namespace MWGui
 {
     StatBars::StatBars(Hotbar* hotbar)
         : mEnabled(true), mWidth(390), mGap(14), mLeftMargin(172), mTextNudge(-3), mHotbar(hotbar), mBarHeight(22), mRoot(nullptr)
-        , mTooltipTimer(0.f)
+        , mTooltipTimer(0.f), mSunPerSecond(0.f)
     {
         mEnabled = settingBool("enabled", true);
         mWidth   = settingInt("width", 0);                    // 0 = fill from left margin to the hotbar
@@ -84,7 +84,7 @@ namespace MWGui
             for (int k = 0; k < 2; ++k)
             {
                 MyGUI::TextBox* t = MyGUI::Gui::getInstance().createWidget<MyGUI::TextBox>("SandBrightText",
-                    MyGUI::IntCoord(0, 0, 24, 24), MyGUI::Align::Default, "Menu");
+                    MyGUI::IntCoord(0, 0, 44, 40), MyGUI::Align::Default, "Menu");   // roomy: the doubled glyph must not wrap
                 t->setCaption(k == 0 ? "-" : "+");
                 t->setFontHeight(t->getFontHeight() * 2);   // a good bit bigger than the bar text
                 t->setTextColour(k == 0 ? MyGUI::Colour(0.95f, 0.35f, 0.3f) : MyGUI::Colour(0.45f, 0.9f, 0.45f));
@@ -141,8 +141,8 @@ namespace MWGui
             bars[i]->text->setCoord(0, mTextNudge, barW - 4, barH - 4);
             // signs: just above the bar's ends (own roots: screen coordinates)
             const int rx = mRoot->getLeft(), ry = mRoot->getTop();
-            bars[i]->minus->setCoord(rx + bx, ry + y - 26, 24, 24);
-            bars[i]->plus->setCoord(rx + bx + barW - 24, ry + y - 26, 24, 24);
+            bars[i]->minus->setCoord(rx + bx - 10, ry + y - 40, 44, 40);
+            bars[i]->plus->setCoord(rx + bx + barW - 34, ry + y - 40, 44, 40);
         }
     }
 
@@ -193,13 +193,21 @@ namespace MWGui
                                              ESM::MagicEffect::FrostDamage, ESM::MagicEffect::ShockDamage, ESM::MagicEffect::AbsorbHealth };
         static const int magickaDamage[] = { ESM::MagicEffect::DamageMagicka, ESM::MagicEffect::AbsorbMagicka };
         static const int fatigueDamage[] = { ESM::MagicEffect::DamageFatigue, ESM::MagicEffect::AbsorbFatigue };
-        // sun damage only counts while it would actually be ticking: outside, in daylight
-        bool sun = false;
-        if (fx.get(MWMechanics::EffectKey(ESM::MagicEffect::SunDamage)).getMagnitude() > 0.f && player.isInCell() && player.getCell()->isExterior())
+        // sun damage only counts while it would actually be ticking: outside, in daylight, scaled like the
+        // engine does (full at 13:00, nothing 7 h either side, fMagicSunBlockedMult when cloudy or worse)
+        mSunPerSecond = 0.f;
+        const float sunMagnitude = fx.get(MWMechanics::EffectKey(ESM::MagicEffect::SunDamage)).getMagnitude();
+        if (sunMagnitude > 0.f && player.isInCell() && player.getCell()->isExterior())
         {
-            const float hour = MWBase::Environment::get().getWorld()->getTimeStamp().getHour();
-            sun = std::abs(hour - 13.f) < 7.f;
+            MWBase::World* world = MWBase::Environment::get().getWorld();
+            const float hour = world->getTimeStamp().getHour();
+            const float timeDiff = std::min(7.f, std::max(0.f, std::abs(hour - 13.f)));
+            float scale = 1.f - timeDiff / 7.f;
+            if (world->getCurrentWeather() > 1)
+                scale *= world->getStore().get<ESM::GameSetting>().find("fMagicSunBlockedMult")->mValue.getFloat();
+            mSunPerSecond = sunMagnitude * scale;
         }
+        const bool sun = mSunPerSecond > 0.f;
         updateSigns(mHealth,  fx, healthDamage,  6, ESM::MagicEffect::RestoreHealth,  sun);
         updateSigns(mMagicka, fx, magickaDamage, 2, ESM::MagicEffect::RestoreMagicka, false);
         updateSigns(mFatigue, fx, fatigueDamage, 2, ESM::MagicEffect::RestoreFatigue, false);
@@ -209,7 +217,7 @@ namespace MWGui
         if (mTooltipTimer >= 0.5f && MWBase::Environment::get().getWindowManager()->isGuiMode())
         {
             mTooltipTimer = 0.f;
-            updateSignTooltips(mHealth,  healthDamage,  6, ESM::MagicEffect::RestoreHealth);
+            updateSignTooltips(mHealth,  healthDamage,  6, ESM::MagicEffect::RestoreHealth, mSunPerSecond);
             updateSignTooltips(mMagicka, magickaDamage, 2, ESM::MagicEffect::RestoreMagicka);
             updateSignTooltips(mFatigue, fatigueDamage, 2, ESM::MagicEffect::RestoreFatigue);
         }
@@ -248,7 +256,7 @@ namespace MWGui
         }
     }
 
-    void StatBars::updateSignTooltips(Bar& b, const int* damageIds, int nDamage, int restoreId)
+    void StatBars::updateSignTooltips(Bar& b, const int* damageIds, int nDamage, int restoreId, float sunPerSecond)
     {
         static const std::string cHeader = colourHex("#{fontcolour=header}");
         static const std::string cNormal = colourHex("#{fontcolour=normal}");
@@ -264,7 +272,13 @@ namespace MWGui
         auto fmt = [](float m) { char buf[16]; snprintf(buf, sizeof(buf), (m < 10.f && std::abs(m - std::lround(m)) > 0.05f) ? "%.1f" : "%.0f", m); return std::string(buf); };
         std::string minus = cHeader + "Losing per second" + cNormal;
         for (const auto& d : v.damage) minus += "\n" + cNegative + d.first + "  " + fmt(d.second) + "/s" + cNormal;
-        if (v.damage.empty()) minus += "\nnothing";
+        if (sunPerSecond > 0.f)
+        {
+            const ESM::MagicEffect* effect = MWBase::Environment::get().getWorld()->getStore().get<ESM::MagicEffect>().search(ESM::MagicEffect::SunDamage);
+            const std::string name = effect ? MWBase::Environment::get().getWindowManager()->getGameSettingString(ESM::MagicEffect::effectIdToString(effect->mIndex), "Sun Damage") : "Sun Damage";
+            minus += "\n" + cNegative + name + ": daylight  " + fmt(sunPerSecond) + "/s" + cNormal;
+        }
+        if (v.damage.empty() && sunPerSecond <= 0.f) minus += "\nnothing";
         std::string plus = cHeader + "Restoring per second" + cNormal;
         for (const auto& r : v.restore) plus += "\n" + r.first + "  " + fmt(r.second) + "/s";
         if (v.restore.empty()) plus += "\nnothing";

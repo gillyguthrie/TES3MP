@@ -61,7 +61,7 @@ namespace MWGui
         void onResChange(int width, int height) override;
 
         bool isEnabled() const { return mEnabled; }
-        /// Layout anchors (majere): resistances hang above the HUD effect icons; the star sits left of the hotbar.
+        /// Layout anchors (majere): resistances hang above the HUD minimap; the star sits just left of the hotbar.
         void setAnchors(HUD* hud, Hotbar* hotbar);
         int getStarSize() const;
 
@@ -86,7 +86,9 @@ namespace MWGui
             bool harmful;
             std::vector<SubEffect> lines;   // potions only: every effect, primary first
             bool timed;             // false: permanent column (no sweep, no seconds)
-            DialData() : timeLeft(0.f), duration(0.f), harmful(false), timed(true) {}
+            bool potion;            // a potion drunk: these hold the corner as a block of their own
+            std::string key;        // which drink this is (record id + when it was drunk), for the run-out warning
+            DialData() : timeLeft(0.f), duration(0.f), harmful(false), timed(true), potion(false) {}
         };
 
         struct LineWidgets
@@ -107,12 +109,13 @@ namespace MWGui
             MyGUI::Widget* root;
             MyGUI::ImageBox* icon;     // plain icon, no frame
             MyGUI::ImageBox* sweep;
+            MyGUI::ImageBox* outline;   // black edge round the elapsed wedge (majere_sweepo_NN), untinted
             MyGUI::TextBox* seconds;   // effects box only
             MyGUI::EditBox* title;     // source name / effect label, word-wrapped to at most two lines
             std::vector<LineWidgets> lines;
             std::string currentIcon;
             int sweepFrame;
-            DialWidgets() : root(nullptr), icon(nullptr), sweep(nullptr), seconds(nullptr), title(nullptr), sweepFrame(-1) {}
+            DialWidgets() : root(nullptr), icon(nullptr), sweep(nullptr), outline(nullptr), seconds(nullptr), title(nullptr), sweepFrame(-1) {}
         };
 
         struct Box
@@ -121,13 +124,22 @@ namespace MWGui
             MyGUI::TextBox* caption;
             std::vector<DialWidgets> dials;
             std::vector<MyGUI::ImageBox*> separators;   // 1 px gold verticals between columns
-            Box() : frame(nullptr), caption(nullptr) {}
+            MyGUI::ImageBox* groupRule;                 // the heavier rule between the potion block and the rest
+            Box() : frame(nullptr), caption(nullptr), groupRule(nullptr) {}
         };
 
         bool mEnabled;
         int mDialSize;
         int mSpacing;
         int mMaxPotions;
+        int mGroupGap;              // [EffectDials] potion block gap: extra space between the potions and the rest
+        // a sound when a potion in the block has this many seconds left, once per drink
+        // ([EffectDials] potion warning seconds / sound / repeats)
+        float mPotionWarnSeconds;
+        std::string mPotionWarnSound;
+        std::map<std::string, int> mPotionsWarned;   // drink -> how many of the repeats have played
+        int mPotionWarnRepeats;                      // [EffectDials] potion warning repeats
+        void warnExpiringPotions(const std::vector<DialData>& columns);
         int mColumnWidth;
         int mRightMargin;
         int mTopMargin;
@@ -156,6 +168,33 @@ namespace MWGui
         MyGUI::Button* mResistButton;   // collapsed: a "Resists" button in the same spot
         bool mResistsExpanded;      // remembered ([EffectDials] resists expanded)
         void onResistsClicked(MyGUI::Widget* sender);   // grid click collapses, button click expands
+        // majere: in a menu the grid wears a title bar -- four layout buttons (1 = one column, 2 = two wide,
+        // 3 = three wide, 4 = one row) and a drag handle; the layout and the dragged spot are remembered
+        // ([EffectDials] resists layout / resists x / resists y). The bar is gone while the game runs.
+        std::vector<std::string> mHiddenSources;   // [EffectDials] hide sources: lower-case name beginnings
+        std::vector<std::string> mNotPotions;      // [EffectDials] not potions: potions kept out of the potion block
+        float mLongPotionSeconds;                  // [EffectDials] long potion minutes: so are potions this long (0 = off)
+        static void readNameList(const std::string& list, std::vector<std::string>& out);
+        int mResistLayout;
+        bool mResistMoved;
+        bool mResistWasInMenu;      // the grid is raised above the game's windows when a menu opens
+        MyGUI::IntPoint mResistPos;
+        MyGUI::Widget* mResistTitle;
+        MyGUI::Button* mResistLayoutButtons[4];
+        MyGUI::IntPoint mResistDragOffset;
+        // the spread grip at the bar's left: dragging it right/left and down/up opens or closes the gaps
+        // between cells ([EffectDials] resists gap x / resists gap y)
+        MyGUI::Widget* mResistGrip;
+        int mResistGapX, mResistGapY;
+        MyGUI::IntPoint mResistGripStart;
+        int mResistGripGapX, mResistGripGapY;
+        void onResistGripPressed(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id);
+        void onResistGripDragged(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id);
+        void onResistLayoutClicked(MyGUI::Widget* sender);
+        void onResistTitlePressed(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id);
+        void onResistTitleDragged(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id);
+        void layoutResistRows(bool withTitle);   // place the six cells (and the bar) for the current layout
+        int resistCols() const;
         HUD* mHud;                  // layout anchors: the minimap box (resists sit above it)
         Hotbar* mHotbar;            // layout anchor: where the star goes
         std::vector<ResistRow> mResistRows;
@@ -199,6 +238,9 @@ namespace MWGui
         /// Vampire sun damage: a permanent ability, so never in ActiveSpells. One untimed column while the
         /// engine would actually be applying it (outside, daylight), showing the scaled per-second damage.
         bool collectSunDamage(DialData& column) const;
+    public:
+        ~EffectDials();
+    private:
         /// "+Speed 10", "++Health 200", "+Health 10/s", "-Agility 5", "--Health 3/s"
         std::string effectLabel(const ESM::MagicEffect* effect, int arg, float magnitude) const;
         void fillBox(Box& box, const std::vector<DialData>& data, int top, bool withLines);
@@ -207,7 +249,7 @@ namespace MWGui
         void applyDial(DialWidgets& w, const DialData& d, int colW, bool potionStyle, int titleH, const std::vector<int>& lineHeights);
         /// measures each effect line's wrapped height at this column width (creates line widgets as needed)
         std::vector<int> measureLines(DialWidgets& w, const DialData& d, int colW);
-        static void setSweep(MyGUI::ImageBox* sweep, int& cachedFrame, float timeLeft, float duration, bool mini);
+        static void setSweep(MyGUI::ImageBox* sweep, int& cachedFrame, float timeLeft, float duration, bool mini, MyGUI::ImageBox* outline = nullptr);
     };
 }
 

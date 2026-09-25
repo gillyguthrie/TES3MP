@@ -29,6 +29,31 @@
             </Widget>
         </Widget>
 
+        <!-- majere: big-map cell tooltip: the cell's name, a rule, then the breakdown (wide, so shop lines fit) -->
+        <Widget type="VBox" skin="HUD_Box_NoTransp" position="0 0 0 0" align="Stretch" name="MajereCellToolTip">
+            <Property key="AutoResize" value="true"/>
+            <Property key="Padding" value="8"/>
+            <Property key="Spacing" value="4"/>
+
+            <Widget type="AutoSizedTextBox" skin="SandBrightText" position="8 8 0 18" align="Left Top" name="CellTitle">
+                <Property key="TextAlign" value="Left Top"/>
+            </Widget>
+
+            <Widget type="ImageBox" skin="ImageBox" position="8 30 0 1" align="Left Top" name="CellRule">
+                <Property key="ImageTexture" value="white"/>
+                <Property key="Colour" value="0.85 0.72 0.42"/>
+                <Property key="Alpha" value="0.8"/>
+                <UserString key="HStretch" value="true"/>
+            </Widget>
+
+            <Widget type="AutoSizedEditBox" skin="SandText" position="8 36 620 0" align="Left Top" name="CellBody">
+                <Property key="MultiLine" value="true"/>
+                <Property key="Shrink" value="true"/>
+                <Property key="WordWrap" value="true"/>
+                <Property key="TextAlign" value="Left Top"/>
+            </Widget>
+        </Widget>
+
         <!-- Faction tooltip -->
         <Widget type="VBox" skin="HUD_Box_NoTransp" position="0 0 0 0" align="Stretch" name="FactionToolTip">
             <Property key="AutoResize" value="true"/>

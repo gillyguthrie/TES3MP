@@ -164,6 +164,10 @@ namespace MWGui
 
         // Keep track of created marker widgets, just to easily remove them later.
         std::vector<MyGUI::Widget*> mDoorMarkerWidgets;
+        std::string mShopSignature;   // majere addition: the tracked set the door coins were drawn for
+        std::vector<MyGUI::Widget*> mPlantDotWidgets;   // majere addition: tracked plants as dots
+        unsigned int mPlantDotsVersion;
+        void updatePlantDots();
         std::vector<MyGUI::Widget*> mMagicMarkerWidgets;
         std::vector<MyGUI::Widget*> mCustomMarkerWidgets;
 
@@ -258,6 +262,8 @@ namespace MWGui
     public:
         MapWindow(CustomMarkerCollection& customMarkers, DragAndDrop* drag, MWRender::LocalMap* localMapRender, SceneUtil::WorkQueue* workQueue);
         virtual ~MapWindow();
+        /// majere addition: the ingredient finder draws its own copy of the world map
+        MWRender::GlobalMap* getGlobalMapRender() const { return mGlobalMapRender; }
 
         void setCellName(const std::string& cellName);
 
@@ -315,6 +321,8 @@ namespace MWGui
         void onDragStart(MyGUI::Widget* _sender, int _left, int _top, MyGUI::MouseButton _id);
         void onMouseDrag(MyGUI::Widget* _sender, int _left, int _top, MyGUI::MouseButton _id);
         void onWorldButtonClicked(MyGUI::Widget* _sender);
+        void onPlayersButtonClicked(MyGUI::Widget* _sender);   // majere addition
+        void updatePlayersButton();
         void onMapDoubleClicked(MyGUI::Widget* sender);
         void onCustomMarkerDoubleClicked(MyGUI::Widget* sender);
         void onNoteEditOk();
@@ -333,6 +341,9 @@ namespace MWGui
         MyGUI::ImageBox* mPlayerArrowLocal;
         MyGUI::ImageBox* mPlayerArrowGlobal;
         MyGUI::Button* mButton;
+        MyGUI::Button* mPlayersButton;   // majere addition: other players' markers on/off
+        MyGUI::Button* mPlantsButton;    // majere addition: tracked-plant dots on/off
+        void onPlantsButtonClicked(MyGUI::Widget* _sender);
         MyGUI::IntPoint mLastDragPos;
         bool mGlobal;
 

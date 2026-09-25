@@ -3,10 +3,17 @@
 */
 #include "ingredients.hpp"
 
+#include "mode.hpp"
+#include "../mwmp/Main.hpp"
+#include "../mwmp/SessionLog.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <set>
 #include <typeinfo>
 
 #include <MyGUI_Gui.h>
@@ -15,8 +22,16 @@
 #include <MyGUI_RenderManager.h>
 #include <MyGUI_RotatingSkin.h>
 #include <MyGUI_TextBox.h>
+#include <MyGUI_ITexture.h>
+#include <MyGUI_LayerManager.h>
 
+#include <osg/Texture2D>
+
+#include <components/debug/debuglog.hpp>
 #include <components/esm/attr.hpp>
+#include <components/esm/loadcell.hpp>
+#include <components/esm/loadregn.hpp>
+#include <components/myguiplatform/myguitexture.hpp>
 #include <components/esm/loadcont.hpp>
 #include <components/esm/loaddoor.hpp>
 #include <components/esm/loadingr.hpp>
@@ -24,6 +39,7 @@
 #include <components/esm/loadmgef.hpp>
 #include <components/esm/loadnpc.hpp>
 #include <components/esm/loadskil.hpp>
+#include <components/misc/constants.hpp>
 #include <components/misc/stringops.hpp>
 #include <components/settings/settings.hpp>
 
@@ -37,7 +53,10 @@
 #include "../mwworld/class.hpp"
 #include "../mwworld/containerstore.hpp"
 #include "../mwworld/esmstore.hpp"
+#include "../mwworld/inventorystore.hpp"
 #include "../mwworld/ptr.hpp"
+#include "../mwrender/globalmap.hpp"
+#include "mapwindow.hpp"
 
 #include "hotbar.hpp"
 
@@ -47,6 +66,11 @@ namespace
     {
         try { return Settings::Manager::getInt(key, "Ingredients"); } catch (...) { return def; }
     }
+    float settingFloat(const char* key, float def)
+    {
+        try { return Settings::Manager::getFloat(key, "Ingredients"); } catch (...) { return def; }
+    }
+
     bool settingBool(const char* key, bool def)
     {
         try { return Settings::Manager::getBool(key, "Ingredients"); } catch (...) { return def; }
@@ -61,6 +85,10 @@ namespace
     const int sCell = 22;         // 3x3 map cell (GUI px)
     const int sCellGap = 2;
     const int sCoin = 10;         // shop marker in a map cell
+    const int sArrowBox = 16;     // the facing arrow: centred on where the player stands within the middle cell
+    const int sWorldPad = 8;
+    const int sWorldCellsPerFrame = 40;
+    const int sWorldInteriorsPerFrame = 12;
     const int sGridIconGap = 4;   // between the map and its icon column
     const size_t sMaxTracked = 3;
     // the picker
@@ -242,6 +270,60 @@ namespace
         return false;
     }
 
+    // the tracked plants of a cell for the local map's dots: where they are, which row they feed, and whether
+    // they still stand on this client
+    struct PlantWalk
+    {
+        const std::vector<MWGui::IngredientDef>& table;
+        const std::vector<bool>& tracked;
+        bool localServer;
+        struct Hit { float x, y; size_t row; bool standing, placed; };
+        std::vector<Hit> hits;
+        PlantWalk(const std::vector<MWGui::IngredientDef>& t, const std::vector<bool>& tr, bool local) : table(t), tracked(tr), localServer(local) {}
+
+        bool operator()(const MWWorld::Ptr& ptr)
+        {
+            const std::string& type = ptr.getClass().getTypeName();
+            size_t row = table.size();
+            if (type == typeid(ESM::Ingredient).name())
+            {
+                const std::string& id = ptr.getCellRef().getRefId();
+                for (size_t i = 0; i < table.size() && row == table.size(); ++i)
+                    if (i < tracked.size() && tracked[i])
+                        for (const std::string& want : table[i].ids)
+                            if (Misc::StringUtils::ciEqual(id, want)) { row = i; break; }
+            }
+            else if (type == typeid(ESM::Container).name())
+            {
+                const ESM::Container* rec = ptr.get<ESM::Container>()->mBase;
+                if (!(rec->mFlags & ESM::Container::Organic))
+                    return true;
+                for (size_t i = 0; i < table.size() && row == table.size(); ++i)
+                    if (i < tracked.size() && tracked[i] && listHas(rec->mInventory, table[i].ids))
+                        row = i;
+            }
+            if (row == table.size())
+                return true;
+            Hit h;
+            const ESM::Position& p = ptr.getRefData().getPosition();
+            h.x = p.pos[0]; h.y = p.pos[1];
+            h.row = row;
+            h.placed = ptr.getCellRef().getRefNum().hasContentFile();
+            h.standing = !ptr.getRefData().isDeleted() && ptr.getRefData().getCount() > 0 && ptr.getRefData().isEnabled();
+            // our own plain local server: an opened plant keeps standing, its emptied contents say it is picked
+            if (h.standing && localServer && type == typeid(ESM::Container).name() && ptr.getRefData().getCustomData())
+            {
+                bool left = false;
+                MWWorld::ContainerStore& store = ptr.getClass().getContainerStore(ptr);
+                for (MWWorld::ContainerStoreIterator it = store.begin(); it != store.end(); ++it)
+                    if (it->getClass().getTypeName() == typeid(ESM::Ingredient).name() && it->getRefData().getCount() > 0) { left = true; break; }
+                h.standing = left;
+            }
+            hits.push_back(h);
+            return true;
+        }
+    };
+
     // one walk over the cell for every ingredient on the list
     struct CellScan
     {
@@ -250,7 +332,11 @@ namespace
         std::vector<std::vector<std::string>> sellers;       // per ingredient: live NPC names here
         const std::vector<std::string>* shopCells;           // lower-case interior names of tracked shops (may be null)
         bool shopDoor;                                       // a door here leads into one of them
-        explicit CellScan(const std::vector<MWGui::IngredientDef>& t) : table(t), raw(t.size(), 0), sellers(t.size()), shopCells(nullptr), shopDoor(false) {}
+        std::vector<std::string> doorShops;                  // which of them (lower-case cell names)
+        bool inside;                                         // an interior: stacks and any container count, doors are exits
+        std::vector<std::string> exitsInterior;
+        std::vector<std::pair<int, int>> exitsExterior;
+        explicit CellScan(const std::vector<MWGui::IngredientDef>& t) : table(t), raw(t.size(), 0), sellers(t.size()), shopCells(nullptr), shopDoor(false), inside(false) {}
 
         bool operator()(const MWWorld::Ptr& ptr)
         {
@@ -263,14 +349,26 @@ namespace
                 if (!ptr.getCellRef().getRefNum().hasContentFile())
                     return true;
                 const std::string& id = ptr.getCellRef().getRefId();
+                const int stack = inside ? std::max(1, ptr.getRefData().getCount()) : 1;
                 for (size_t i = 0; i < table.size(); ++i)
                     for (const std::string& want : table[i].ids)
-                        if (Misc::StringUtils::ciEqual(id, want)) { ++raw[i]; break; }
+                        if (Misc::StringUtils::ciEqual(id, want)) { raw[i] += stack; break; }
             }
             else if (type == typeid(ESM::Container).name())
             {
                 const ESM::Container* rec = ptr.get<ESM::Container>()->mBase;
-                if (!(rec->mFlags & ESM::Container::Organic) || !ptr.getCellRef().getRefNum().hasContentFile())
+                if (!ptr.getCellRef().getRefNum().hasContentFile())
+                    return true;
+                if (inside && !(rec->mFlags & ESM::Container::Organic))
+                {
+                    // a crate, sack or chest: what its record holds, by the stack
+                    for (const ESM::ContItem& item : rec->mInventory.mList)
+                        for (size_t i = 0; i < table.size(); ++i)
+                            for (const std::string& want : table[i].ids)
+                                if (Misc::StringUtils::ciEqual(item.mItem, want)) { raw[i] += std::abs(item.mCount); break; }
+                    return true;
+                }
+                if (!(rec->mFlags & ESM::Container::Organic))
                     return true;
                 for (size_t i = 0; i < table.size(); ++i)
                     if (listHas(rec->mInventory, table[i].ids))
@@ -278,11 +376,25 @@ namespace
             }
             else if (type == typeid(ESM::Door).name())
             {
-                if (!shopCells || !ptr.getCellRef().getTeleport())
+                if (!ptr.getCellRef().getTeleport())
                     return true;
                 const std::string dest = Misc::StringUtils::lowerCase(ptr.getCellRef().getDestCell());
+                if (inside)
+                {
+                    if (dest.empty())
+                    {
+                        const ESM::Position& out = ptr.getCellRef().getDoorDest();
+                        const float cs = static_cast<float>(Constants::CellSizeInUnits);
+                        exitsExterior.emplace_back(static_cast<int>(std::floor(out.pos[0] / cs)), static_cast<int>(std::floor(out.pos[1] / cs)));
+                    }
+                    else
+                        exitsInterior.push_back(dest);
+                    return true;
+                }
+                if (!shopCells)
+                    return true;
                 for (const std::string& s : *shopCells)
-                    if (s == dest) { shopDoor = true; break; }
+                    if (s == dest) { shopDoor = true; doorShops.push_back(dest); break; }
             }
             else if (type == typeid(ESM::NPC).name())
             {
@@ -332,16 +444,40 @@ namespace MWGui
     Ingredients::Ingredients(Hotbar* hotbar)
         : mEnabled(true), mInfoWidth(460), mShowShops(false), mShowRaw(false), mHudVisible(false), mHotbar(hotbar)
         , mTrackIcon(nullptr), mShopsIcon(nullptr), mRawIcon(nullptr), mNormalColour(MyGUI::Colour::White)
-        , mPicker(nullptr), mSearchEdit(nullptr), mInfo(nullptr), mGrid(nullptr), mCompass(nullptr)
-        , mAnyShops(false), mAnyRaw(false), mScanTimer(sScanInterval), mLastCell(nullptr)
+        , mPicker(nullptr), mSearchEdit(nullptr), mPickerClose(nullptr), mPickerMap(nullptr), mInfo(nullptr), mGrid(nullptr), mCompass(nullptr)
+        , mMapWindow(nullptr), mMapButton(nullptr), mWorldMap(nullptr), mWorldImage(nullptr), mWorldStatus(nullptr), mWorldClose(nullptr), mWorldPick(nullptr)
+        , mWorldArrow(nullptr), mWorldScanning(false), mWorldNext(0), mWorldInteriorNext(0), mWorldScale(1.f)
+        , mWorldGrip(nullptr), mPickerMoved(false), mWorldMoved(false), mWorldUserScale(0.f)
+        , mGuiLast(false), mPickerReopen(false), mWorldReopen(false)
+        , mAnyShops(false), mAnyRaw(false), mScanTimer(sScanInterval), mLastCell(nullptr), mRingPending(false)
     {
         mEnabled   = settingBool("enabled", true);
         mInfoWidth = std::max(200, settingInt("info width", 460));
         mShowShops = settingBool("show shops", false);
+        mGridBig = settingBool("grid big", false);
+        {
+            std::string mode = "dynamic";
+            try { mode = Misc::StringUtils::lowerCase(Settings::Manager::getString("plants mode", "Ingredients")); } catch (...) {}
+            mPlantsMode = mode == "off" ? Plants_Off : mode == "static" ? Plants_Static : Plants_Dynamic;
+        }
+        mHereStanding = mHerePlaced = 0;
+        for (int i = 0; i < 25; ++i) mGridLive[i] = false;
+        mDotsVersion = 1;
+        mPickerPos = MyGUI::IntPoint(settingInt("picker x", -1), settingInt("picker y", -1));
+        mPickerMoved = mPickerPos.left >= 0 && mPickerPos.top >= 0;
+        mWorldPos = MyGUI::IntPoint(settingInt("world map x", -1), settingInt("world map y", -1));
+        mWorldMoved = mWorldPos.left >= 0 && mWorldPos.top >= 0;
+        mWorldUserScale = settingFloat("world map scale", 0.f);
+        if (mWorldUserScale > 0.f)
+            mWorldUserScale = std::max(0.3f, std::min(1.6f, mWorldUserScale));
         mShowRaw   = settingBool("show raw", false);
 
         mNormalColour = MyGUI::Colour::parse(MyGUI::LanguageManager::getInstance().replaceTags("#{fontcolour=normal}"));
-        for (int i = 0; i < 3; ++i) mGridIcon[i] = nullptr;
+        mIconRow = nullptr;
+        for (int i = 0; i < 3; ++i) { mGridIcon[i] = nullptr; mGridQty[i] = nullptr; }
+        for (int i = 0; i < 25; ++i) { mGridBg[i] = nullptr; mGridText[i] = nullptr; mGridCoin[i] = nullptr; }
+        sInstance = this;
+        buildCatalogue();
         loadTracked();
 
         MyGUI::Gui& gui = MyGUI::Gui::getInstance();
@@ -361,10 +497,18 @@ namespace MWGui
         const int pickerW = 2 * sPad + sCols * sTile + (sCols - 1) * sTileGap;
         mPicker = gui.createWidget<MyGUI::Widget>("HUD_Box_NoTransp", MyGUI::IntCoord(0, 0, pickerW, 100), MyGUI::Align::Default, "Windows");
         mPicker->setNeedMouseFocus(true);
+        mPicker->eventMouseButtonPressed += MyGUI::newDelegate(this, &Ingredients::onFramePressed);
+        mPicker->eventMouseDrag += MyGUI::newDelegate(this, &Ingredients::onFrameDragged);
         mSearchEdit = mPicker->createWidget<MyGUI::EditBox>("MW_TextEdit", MyGUI::IntCoord(sPad, 0, pickerW - 2 * sPad, sSearchH), MyGUI::Align::Default);
         mSearchEdit->setNeedKeyFocus(true);
         mSearchEdit->setNeedMouseFocus(true);
         mSearchEdit->eventEditTextChange += MyGUI::newDelegate(this, &Ingredients::onSearchChanged);
+        mPickerClose = mPicker->createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(pickerW - sPad - 56, sPad, 56, 20), MyGUI::Align::Default);
+        mPickerClose->setCaption("Close");
+        mPickerClose->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onTrackClicked);   // toggles it shut
+        mPickerMap = mPicker->createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(pickerW - sPad - 56 - 6 - 48, sPad, 48, 20), MyGUI::Align::Default);
+        mPickerMap->setCaption("Map");
+        mPickerMap->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onMapClicked);
         mPicker->setVisible(false);
 
         // icons: own Menu-layer roots (clickable in menus)
@@ -389,20 +533,26 @@ namespace MWGui
         // the 3x3 map: dark cells with the count, north up, compass in the middle cell, coin = shop; the
         // tracked ingredients' icons in a row on its right, on the icon line (bottom-aligned with the map)
         const int gridSize = 3 * sCell + 2 * sCellGap;
-        mGrid = gui.createWidget<MyGUI::Widget>("", MyGUI::IntCoord(0, 0, gridSize + sGridIconGap + 3 * sIcon + 2 * sGridIconGap, gridSize), MyGUI::Align::Default, "Menu");
+        mGrid = gui.createWidget<MyGUI::Widget>("", MyGUI::IntCoord(0, 0, gridSize, gridSize), MyGUI::Align::Default, "Menu");
         mGrid->setNeedMouseFocus(true);
         mGrid->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onGridClicked);
         mGrid->setUserString("ToolTipType", "Layout");
         mGrid->setUserString("ToolTipLayout", "TextToolTip");
-        mGrid->setUserString("Caption_Text", "Tracked ingredients in the cells around you, north up; a coin marks a shop (click to fold)");
-        for (int i = 0; i < 9; ++i)
+        mGrid->setUserString("Caption_Text", "Tracked ingredients in the cells around you, north up; a coin marks a shop\nClick: 3x3, then 5x5, then folded");
+        for (int i = 0; i < 25; ++i)
         {
-            const int cx = (i % 3) * (sCell + sCellGap), cy = (i / 3) * (sCell + sCellGap);
+            const int cx = (i % 5) * (sCell + sCellGap), cy = (i / 5) * (sCell + sCellGap);
             mGridBg[i] = mGrid->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(cx, cy, sCell, sCell), MyGUI::Align::Default);
             mGridBg[i]->setImageTexture("white");
-            mGridBg[i]->setColour(i == 4 ? MyGUI::Colour(0.35f, 0.28f, 0.12f) : MyGUI::Colour(0.f, 0.f, 0.f));
+            mGridBg[i]->setColour(i == 12 ? MyGUI::Colour(0.35f, 0.28f, 0.12f) : MyGUI::Colour(0.f, 0.f, 0.f));
             mGridBg[i]->setAlpha(0.55f);
-            mGridBg[i]->setNeedMouseFocus(false);
+            // each cell carries the big map's tooltip for that cell; a click still steps the grid
+            mGridBg[i]->setNeedMouseFocus(true);
+            mGridBg[i]->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onGridClicked);
+            mGridBg[i]->setUserString("ToolTipType", "Layout");
+            mGridBg[i]->setUserString("ToolTipLayout", "MajereCellToolTip");
+            mGridBg[i]->setUserString("Caption_CellTitle", "");
+            mGridBg[i]->setUserString("Caption_CellBody", "");
             mGridCount[i] = 0;
             mGridLoaded[i] = false;
             mGridShop[i] = false;
@@ -410,12 +560,13 @@ namespace MWGui
         // the facing arrow: a small gold arrow head at the top of a transparent cell-sized image, rotated about the
         // cell's centre by the RotatingSkin, so it rides the rim of the middle cell and never covers the count
         mCompass = mGrid->createWidget<MyGUI::ImageBox>("RotatingSkin",
-            MyGUI::IntCoord(sCell + sCellGap, sCell + sCellGap, sCell, sCell), MyGUI::Align::Default);
+            MyGUI::IntCoord(sCell + sCellGap + sCell / 2 - sArrowBox / 2, sCell + sCellGap + sCell / 2 - sArrowBox / 2, sArrowBox, sArrowBox), MyGUI::Align::Default);
+        mCompass->setAlpha(0.9f);
         mCompass->setImageTexture("textures\\majere_maparrow.png");
         mCompass->setNeedMouseFocus(false);
-        for (int i = 0; i < 9; ++i)
+        for (int i = 0; i < 25; ++i)
         {
-            const int cx = (i % 3) * (sCell + sCellGap), cy = (i / 3) * (sCell + sCellGap);
+            const int cx = (i % 5) * (sCell + sCellGap), cy = (i / 5) * (sCell + sCellGap);
             mGridText[i] = mGrid->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(cx, cy, sCell, sCell), MyGUI::Align::Default);
             mGridText[i]->setTextAlign(MyGUI::Align::Center);
             mGridText[i]->setTextShadow(true);
@@ -426,15 +577,69 @@ namespace MWGui
             mGridCoin[i]->setNeedMouseFocus(false);
             mGridCoin[i]->setVisible(false);
         }
+        layoutGrid();
+        // the tracked icons: their own root (nothing of the grid's click area may sit over the Map button)
+        mIconRow = gui.createWidget<MyGUI::Widget>("", MyGUI::IntCoord(0, 0, 3 * sIcon + 2 * sGridIconGap, sIcon), MyGUI::Align::Default, "Menu");
+        // the row itself takes the click too (a click anywhere on it opens the picker): a pick through a
+        // root that wants no mouse focus proved unreliable
+        mIconRow->setNeedMouseFocus(true);
+        mIconRow->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onIconRowClicked);
+        mIconRow->setVisible(false);
         for (int i = 0; i < 3; ++i)
         {
             Look none;
             none.colour = mNormalColour;
-            mGridIcon[i] = makeTile(mGrid, gridSize + sGridIconGap + i * (sIcon + sGridIconGap), gridSize - sIcon, sIcon, none, true);   // plain vanilla icon
-            mGridIcon[i]->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onGridClicked);   // any click folds the map
+            mGridIcon[i] = makeTile(mIconRow, i * (sIcon + sGridIconGap), 0, sIcon, none, true);   // plain vanilla icon
+            mGridIcon[i]->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onIconRowClicked);   // folds / unfolds the map
             mGridIcon[i]->setVisible(false);
+            mGridQty[i] = mGridIcon[i]->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(0, sIcon - 16, sIcon - 1, 16), MyGUI::Align::Default);
+            mGridQty[i]->setTextAlign(MyGUI::Align::Right | MyGUI::Align::Bottom);
+            mGridQty[i]->setTextShadow(true);
+            mGridQty[i]->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.45f));
+            mGridQty[i]->setNeedMouseFocus(false);
+            mGridQty[i]->setCaption("");
         }
         mGrid->setVisible(false);
+
+        // "Map" under the 3x3 map: the whole world with per-cell counts of the tracked plants
+        mMapButton = gui.createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(0, 0, gridSize, 24), MyGUI::Align::Default, "Menu");
+        mMapButton->setCaption("Map");
+        mMapButton->setNeedMouseFocus(true);
+        mMapButton->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onMapClicked);
+        mMapButton->setUserString("ToolTipType", "Layout");
+        mMapButton->setUserString("ToolTipLayout", "TextToolTip");
+        mMapButton->setUserString("Caption_Text", "The whole world map with the number of tracked plants in every cell (its Close button shuts it)\nA click on the grid above steps it: 3x3, 5x5, folded");
+        mMapButton->setVisible(false);
+        layoutGrid();   // the button's width follows the grid's view
+
+        mWorldMap = gui.createWidget<MyGUI::Widget>("HUD_Box_NoTransp", MyGUI::IntCoord(0, 0, 100, 100), MyGUI::Align::Default, "Windows");
+        mWorldMap->setNeedMouseFocus(true);
+        mWorldMap->eventMouseButtonPressed += MyGUI::newDelegate(this, &Ingredients::onFramePressed);
+        mWorldMap->eventMouseDrag += MyGUI::newDelegate(this, &Ingredients::onFrameDragged);
+        mWorldImage = mWorldMap->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(sWorldPad, sWorldPad, 10, 10), MyGUI::Align::Default);
+        mWorldImage->setNeedMouseFocus(false);
+        mWorldStatus = mWorldMap->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(sWorldPad, 0, 10, 20), MyGUI::Align::Default);
+        mWorldStatus->setNeedMouseFocus(true);   // the title bar drags the map
+        mWorldStatus->eventMouseButtonPressed += MyGUI::newDelegate(this, &Ingredients::onFramePressed);
+        mWorldStatus->eventMouseDrag += MyGUI::newDelegate(this, &Ingredients::onFrameDragged);
+        mWorldStatus->setTextColour(sGold);
+        mWorldClose = mWorldMap->createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(0, 0, 56, 20), MyGUI::Align::Default);
+        mWorldClose->setCaption("Close");
+        mWorldClose->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onWorldCloseClicked);
+        mWorldPick = mWorldMap->createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(0, 0, 72, 20), MyGUI::Align::Default);
+        mWorldPick->setCaption("Track");
+        mWorldPick->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onTrackClicked);
+        mWorldGrip = mWorldMap->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(0, 0, 14, 14), MyGUI::Align::Default);
+        mWorldGrip->castType<MyGUI::ImageBox>()->setImageTexture("white");
+        mWorldGrip->setColour(sGold);
+        mWorldGrip->setAlpha(0.75f);
+        mWorldGrip->setNeedMouseFocus(true);
+        mWorldGrip->setUserString("ToolTipType", "Layout");
+        mWorldGrip->setUserString("ToolTipLayout", "TextToolTip");
+        mWorldGrip->setUserString("Caption_Text", "Drag to resize the map; drag the frame to move it");
+        mWorldGrip->eventMouseButtonPressed += MyGUI::newDelegate(this, &Ingredients::onGripPressed);
+        mWorldGrip->eventMouseDrag += MyGUI::newDelegate(this, &Ingredients::onGripDragged);
+        mWorldMap->setVisible(false);
         rebuildTable();
 
         // the shops block (HUD layer: never needs the mouse)
@@ -451,9 +656,13 @@ namespace MWGui
 
     Ingredients::~Ingredients()
     {
+        sInstance = nullptr;
         MyGUI::Gui& gui = MyGUI::Gui::getInstance();
         if (mInfo) gui.destroyWidget(mInfo);
         if (mGrid) gui.destroyWidget(mGrid);
+        if (mIconRow) gui.destroyWidget(mIconRow);
+        if (mMapButton) gui.destroyWidget(mMapButton);
+        if (mWorldMap) gui.destroyWidget(mWorldMap);
         if (mPicker) gui.destroyWidget(mPicker);   // takes the search box and the tiles with it
         if (mTrackIcon) gui.destroyWidget(mTrackIcon);
         if (mShopsIcon) gui.destroyWidget(mShopsIcon);
@@ -462,8 +671,8 @@ namespace MWGui
 
     void Ingredients::place()
     {
-        // icons from the hotbar's anchor (right of its page label), vertically centred on the slot row; the
-        // panel above the first icon, bottom-anchored so it only ever grows upward
+        // icons from the hotbar's anchor (right of its page label), vertically centred on it; the panel above
+        // the first icon, bottom-anchored so it only ever grows upward
         const MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
         MyGUI::IntCoord anchor(view.width / 2 + 300, view.height - 40, 0, 24);
         if (mHotbar)
@@ -476,19 +685,26 @@ namespace MWGui
         if (mShopsIcon->getVisible())
             x += sIcon + sIconGap;
         mRawIcon->setCoord(x, y, sIcon, sIcon);
-        // the 3x3 map sits where the icon is, bottom-left aligned to it
-        mGrid->setPosition(x, y + sIcon - mGrid->getHeight());
+        // the 3x3 map sits where the icon is, bottom-left aligned to it; the Map button just under it
+        // the Map button (as wide as the cells) under the grid, kept on screen; the cells move up to leave it
+        // room while the tracked icons stay level with the mortar icon
+        const int gridSize = gridPixels();
+        mMapButton->setPosition(x, std::min(y + sIcon + 2, view.height - mMapButton->getHeight() - 2));
+        mGrid->setPosition(x, mMapButton->getTop() - 2 - gridSize);
+        // the tracked icons: right of the grid when it is up, right of the alchemy icon when it is folded
+        mIconRow->setPosition(x + (mGrid->getVisible() ? gridSize : sIcon) + sIconGap, y);
 
-        // the picker above the mortar icon, kept on screen
-        int px = mTrackIcon->getLeft(), py = y - 4 - mPicker->getHeight();
-        px = std::max(4, std::min(px, view.width - mPicker->getWidth() - 4));
-        py = std::max(4, py);
+        // the picker above the mortar icon, kept on screen -- unless the user dragged it somewhere
+        int px = mPickerMoved ? mPickerPos.left : mTrackIcon->getLeft();
+        int py = mPickerMoved ? mPickerPos.top : y - 4 - mPicker->getHeight();
+        px = std::max(0, std::min(px, view.width - mPicker->getWidth()));
+        py = std::max(0, std::min(py, view.height - 24));
         mPicker->setPosition(px, py);
         // the shops block sits above the icons (above the open map if it is up); right of the picker when open
         const int panelX = mPicker->getVisible() ? mPicker->getRight() + 12 : mShopsIcon->getLeft();
         int bottom = y - 6;
         if (mGrid->getVisible())
-            bottom = std::min(bottom, mGrid->getTop() - 6);
+            bottom = std::min(bottom, mGrid->getTop() - 6);   // (the cells start at the root's top)
         if (mInfo->getVisible())
         {
             const int hs = std::max(20, mInfo->getTextSize().height + 4);
@@ -506,11 +722,77 @@ namespace MWGui
             mRawIcon->setVisible(false);
             mInfo->setVisible(false);
             mGrid->setVisible(false);
+            mIconRow->setVisible(false);
+            mMapButton->setVisible(false);
+            mWorldMap->setVisible(false);
             mPicker->setVisible(false);
         }
     }
 
     // ---------------------------------------------------------------- tracked set
+
+    Ingredients* Ingredients::sInstance = nullptr;
+
+    const std::vector<Ingredients::PlantDot>& Ingredients::plantDots()
+    {
+        static const std::vector<PlantDot> none;
+        return (sInstance && sInstance->mPlantsMode != Plants_Off) ? sInstance->mDots : none;
+    }
+
+    unsigned int Ingredients::plantDotsVersion()
+    {
+        return sInstance ? sInstance->mDotsVersion : 0;
+    }
+
+    int Ingredients::plantsMode()
+    {
+        return sInstance ? sInstance->mPlantsMode : Plants_Off;
+    }
+
+    std::string Ingredients::plantsModeLabel()
+    {
+        const int mode = plantsMode();
+        return mode == Plants_Dynamic ? "Plants: dynamic" : mode == Plants_Static ? "Plants: static" : "Plants: off";
+    }
+
+    void Ingredients::cyclePlantsMode()
+    {
+        if (!sInstance)
+            return;
+        int& mode = sInstance->mPlantsMode;
+        mode = mode == Plants_Dynamic ? Plants_Static : mode == Plants_Static ? Plants_Off : Plants_Dynamic;
+        Settings::Manager::setString("plants mode", "Ingredients",
+            mode == Plants_Dynamic ? "dynamic" : mode == Plants_Static ? "static" : "off");
+        ++sInstance->mDotsVersion;
+        sInstance->mScanTimer = sScanInterval;   // dots and counts follow at once
+    }
+
+    std::vector<std::string> Ingredients::shopLines(const std::string& interiorCell)
+    {
+        std::vector<std::string> lines;
+        if (!sInstance || interiorCell.empty())
+            return lines;
+        const std::vector<IngredientDef>& table = sInstance->mTable;
+        for (size_t i = 0; i < table.size(); ++i)
+        {
+            if (i < sInstance->mTracked.size() && !sInstance->mTracked[i])
+                continue;
+            for (const IngredientSeller& s : table[i].sellers)
+            {
+                if (!Misc::StringUtils::ciEqual(s.cell, interiorCell))
+                    continue;
+                const int stock = sInstance->keeperStock(s.npc, table[i].ids);
+                lines.push_back(table[i].name + (stock > 0 ? " (" + std::to_string(stock) + ")" : "") + ": " + s.npc);
+            }
+        }
+        return lines;
+    }
+
+    const std::string& Ingredients::trackedSignature()
+    {
+        static const std::string none;
+        return sInstance ? sInstance->mWorldSignature : none;
+    }
 
     bool Ingredients::isTracked(const std::string& id) const
     {
@@ -588,11 +870,20 @@ namespace MWGui
             IngredientDef def;
             def.name = rec->mName;
             def.group = 2;
-            def.ids.push_back(id);
+            const CatalogueEntry* entry = catalogueEntry(id);
+            if (entry && !entry->ids.empty())
+                def.ids = entry->ids;   // every record of that name
+            else
+                def.ids.push_back(id);
             mTable.push_back(def);
         }
         mTracked.assign(mTable.size(), true);
         mFound.assign(mTable.size(), Found());
+        {
+            std::string sig;
+            for (const IngredientDef& def : mTable) for (const std::string& id : def.ids) sig += id + ";";
+            if (sig != mWorldSignature) { mRingCache.clear(); mWorldSignature = sig; mWorldCounts.clear(); mWorldShops.clear(); mWorldBreakdown.clear(); mWorldInside.clear(); mWorldInteriors.clear(); mWorldScanning = false; if (mWorldMap && mWorldMap->getVisible()) openWorldMap(); }
+        }
         mTableLook.clear();
         for (const IngredientDef& def : mTable)
         {
@@ -684,8 +975,19 @@ namespace MWGui
         {
             if (rec.mName.empty())
                 continue;
+            const std::string id = Misc::StringUtils::lowerCase(rec.mId);
+            // the Daedric shrines' cursed copies share the real ingredient's name; they are never worth tracking
+            if (id.find("cursed") != std::string::npos)
+                continue;
+            // a second record with the same name (expansions and mods repeat names) joins the first entry
+            bool merged = false;
+            for (CatalogueEntry& other : mCatalogue)
+                if (Misc::StringUtils::ciEqual(other.name, rec.mName)) { other.ids.push_back(id); merged = true; break; }
+            if (merged)
+                continue;
             CatalogueEntry e;
-            e.id = Misc::StringUtils::lowerCase(rec.mId);
+            e.id = id;
+            e.ids.push_back(id);
             e.name = rec.mName;
             const Look look = lookOf(rec);
             e.icon = look.icon;
@@ -710,8 +1012,9 @@ namespace MWGui
     const Ingredients::CatalogueEntry* Ingredients::catalogueEntry(const std::string& id) const
     {
         for (const CatalogueEntry& e : mCatalogue)
-            if (e.id == id)
-                return &e;
+            for (const std::string& x : e.ids)
+                if (x == id)
+                    return &e;
         return nullptr;
     }
 
@@ -722,7 +1025,7 @@ namespace MWGui
         look.colour = e.colour;
         look.colour2 = e.colour2;
         look.tooltip = e.tooltip;
-        MyGUI::ImageBox* back = makeTile(mPicker, x, y, sTile, look);
+        MyGUI::ImageBox* back = makeTile(mPicker, x, y, sTile, look, true);   // no colour backing (the tooltip keeps the coloured effects)
         back->setUserString("Id", e.id);
         back->eventMouseButtonClick += MyGUI::newDelegate(this, &Ingredients::onTileClicked);
         if (starred)
@@ -732,6 +1035,16 @@ namespace MWGui
             star->setTextColour(sGold);
             star->setTextShadow(true);
             star->setNeedMouseFocus(false);
+        }
+        const int carried = inventoryCount(e.ids);
+        if (carried > 0)
+        {
+            MyGUI::TextBox* qty = back->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(0, sTile - 16, sTile - 1, 16), MyGUI::Align::Default);
+            qty->setCaption(std::to_string(carried));
+            qty->setTextAlign(MyGUI::Align::Right | MyGUI::Align::Bottom);
+            qty->setTextShadow(true);
+            qty->setTextColour(MyGUI::Colour(0.95f, 0.85f, 0.45f));
+            qty->setNeedMouseFocus(false);
         }
         mPickerWidgets.push_back(back);
         return back;
@@ -748,10 +1061,13 @@ namespace MWGui
         const int innerW = mPicker->getWidth() - 2 * sPad;
         int y = sPad;
         auto header = [&](const std::string& text) {
-            MyGUI::TextBox* t = mPicker->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(sPad, y, innerW, sHeaderH), MyGUI::Align::Default);
+            // the first header shares its row with the Map and Close buttons
+            MyGUI::TextBox* t = mPicker->createWidget<MyGUI::TextBox>("SandBrightText", MyGUI::IntCoord(sPad, y, y == sPad ? innerW - 120 : innerW, sHeaderH), MyGUI::Align::Default);
             t->setCaption(text);
             t->setTextColour(sGold);
-            t->setNeedMouseFocus(false);
+            t->setNeedMouseFocus(true);   // a header drags the picker
+            t->eventMouseButtonPressed += MyGUI::newDelegate(this, &Ingredients::onFramePressed);
+            t->eventMouseDrag += MyGUI::newDelegate(this, &Ingredients::onFrameDragged);
             mPickerWidgets.push_back(t);
             y += sHeaderH + 2;
         };
@@ -800,15 +1116,25 @@ namespace MWGui
         header("Search by name or effect, hover for the effects:");
         mSearchEdit->setPosition(sPad, y);
         y += sSearchH + 6;
-        const std::vector<std::string> words = splitList(Misc::StringUtils::lowerCase(mSearchEdit->getCaption()), true);
+        // the typed text is matched as ONE phrase against the name and against each effect on its own:
+        // "resist fire" finds Resist Fire, not an ingredient that has some Resist and some Fire effect
+        std::string phrase = Misc::StringUtils::lowerCase(mSearchEdit->getCaption());
+        {
+            std::string packed;
+            for (char ch : phrase)
+            {
+                if (ch == '|') continue;                       // the field separator is not searchable
+                if (ch == ' ' && (packed.empty() || packed.back() == ' ')) continue;
+                packed += ch;
+            }
+            while (!packed.empty() && packed.back() == ' ') packed.pop_back();
+            phrase.swap(packed);
+        }
         std::vector<std::string> hits;
         int more = 0;
         for (const CatalogueEntry& e : mCatalogue)
         {
-            bool ok = true;
-            for (const std::string& w : words)
-                if (e.searchText.find(w) == std::string::npos) { ok = false; break; }
-            if (!ok)
+            if (!phrase.empty() && e.searchText.find(phrase) == std::string::npos)
                 continue;
             if (static_cast<int>(hits.size()) >= sMaxResults) { ++more; continue; }
             hits.push_back(e.id);
@@ -837,6 +1163,7 @@ namespace MWGui
             return;
         const bool open = !mPicker->getVisible();
         mPicker->setVisible(open);
+        mPickerReopen = open;
         if (open)
         {
             rebuildPicker();
@@ -885,6 +1212,619 @@ namespace MWGui
         mLastShopsText.clear();
     }
 
+    // ---------------------------------------------------------------- inventory count, world map
+
+    int Ingredients::inventoryCount(const IngredientDef& def) const
+    {
+        return inventoryCount(def.ids);
+    }
+
+    int Ingredients::inventoryCount(const std::vector<std::string>& ids) const
+    {
+        MWWorld::Ptr player = MWMechanics::getPlayer();
+        if (player.isEmpty())
+            return 0;
+        int n = 0;
+        MWWorld::InventoryStore& inv = player.getClass().getInventoryStore(player);
+        for (MWWorld::ContainerStoreIterator it = inv.begin(); it != inv.end(); ++it)
+        {
+            const std::string& id = it->getCellRef().getRefId();
+            for (const std::string& want : ids)
+                if (Misc::StringUtils::ciEqual(id, want)) { n += it->getRefData().getCount(); break; }
+        }
+        return n;
+    }
+
+    void Ingredients::onMapClicked(MyGUI::Widget* /*sender*/)
+    {
+        if (!MWBase::Environment::get().getWindowManager()->isGuiMode())
+            return;
+        Log(Debug::Info) << "[Ingredients] Map button: world map " << (mWorldMap->getVisible() ? "closing" : "opening");
+        if (mWorldMap->getVisible())
+        {
+            closeWorldMap();
+            mWorldReopen = false;
+        }
+        else
+        {
+            openWorldMap();
+            mWorldReopen = true;
+        }
+    }
+
+    void Ingredients::onWorldCloseClicked(MyGUI::Widget* /*sender*/)
+    {
+        closeWorldMap();
+        mWorldReopen = false;
+    }
+
+    void Ingredients::closeWorldMap()
+    {
+        mWorldMap->setVisible(false);
+    }
+
+    void Ingredients::openWorldMap()
+    {
+        if (!mMapWindow || !mMapWindow->getGlobalMapRender())
+            return;
+        MWRender::GlobalMap* gm = mMapWindow->getGlobalMapRender();
+        const int w = gm->getWidth(), h = gm->getHeight();
+        if (w <= 0 || h <= 0 || !gm->getBaseTexture())
+            return;
+        if (!mWorldTexture)
+        {
+            mWorldTexture.reset(new osgMyGUI::OSGTexture(gm->getBaseTexture()));
+            mWorldImage->setRenderItemTexture(mWorldTexture.get());
+            mWorldImage->getSubWidgetMain()->_setUVSet(MyGUI::FloatRect(0.f, 0.f, 1.f, 1.f));
+        }
+        layoutWorldMap();
+        mWorldMap->setVisible(true);
+        MyGUI::LayerManager::getInstance().upLayerItem(mWorldMap);
+        if (mPicker->getVisible())
+            MyGUI::LayerManager::getInstance().upLayerItem(mPicker);
+        if (mWorldCounts.empty() && !mWorldScanning)
+        {
+            // every exterior cell in the game data, counted a few per frame
+            mWorldQueue.clear();
+            const MWWorld::Store<ESM::Cell>& cells = MWBase::Environment::get().getWorld()->getStore().get<ESM::Cell>();
+            for (MWWorld::Store<ESM::Cell>::iterator it = cells.extBegin(); it != cells.extEnd(); ++it)
+                mWorldQueue.emplace_back(it->getGridX(), it->getGridY());
+            mWorldNext = 0;
+            mWorldInteriorQueue.clear();
+            for (MWWorld::Store<ESM::Cell>::iterator it = cells.intBegin(); it != cells.intEnd(); ++it)
+                mWorldInteriorQueue.push_back(it->mName);
+            mWorldInteriorNext = 0;
+            mWorldInteriors.clear();
+            mWorldInside.clear();
+            mWorldScanning = !mWorldQueue.empty();
+        }
+        rebuildWorldCells();
+    }
+
+    // how many of an ingredient the keeper's record carries (vanilla restocking stock is a negative count in
+    // the NPC's inventory list; the sign is dropped). Looked up by name, cached.
+    int Ingredients::keeperStock(const std::string& npc, const std::vector<std::string>& ids)
+    {
+        const std::string key = npc + "|" + (ids.empty() ? std::string() : ids.front());
+        std::map<std::string, int>::const_iterator hit = mStockCache.find(key);
+        if (hit != mStockCache.end())
+            return hit->second;
+        int n = 0;
+        const MWWorld::Store<ESM::NPC>& npcs = MWBase::Environment::get().getWorld()->getStore().get<ESM::NPC>();
+        for (const ESM::NPC& rec : npcs)
+        {
+            if (!Misc::StringUtils::ciEqual(rec.mName, npc))
+                continue;
+            for (const ESM::ContItem& item : rec.mInventory.mList)
+                for (const std::string& id : ids)
+                    if (Misc::StringUtils::ciEqual(item.mItem, id)) { n += std::abs(item.mCount); break; }
+            break;
+        }
+        mStockCache[key] = n;
+        return n;
+    }
+
+    // an exterior cell's name for a tooltip: its own name, else its region's, with the grid coordinates
+    std::string Ingredients::worldCellName(int x, int y) const
+    {
+        const MWWorld::ESMStore& store = MWBase::Environment::get().getWorld()->getStore();
+        std::string name;
+        const ESM::Cell* cell = store.get<ESM::Cell>().search(x, y);
+        if (cell)
+        {
+            name = cell->mName;
+            if (name.empty())
+            {
+                const ESM::Region* region = store.get<ESM::Region>().search(cell->mRegion);
+                if (region)
+                    name = region->mName;
+            }
+        }
+        if (name.empty())
+            name = "Wilderness";
+        return name + " (" + std::to_string(x) + ", " + std::to_string(y) + ")";
+    }
+
+    void Ingredients::layoutWorldMap()
+    {
+        if (!mMapWindow || !mMapWindow->getGlobalMapRender())
+            return;
+        MWRender::GlobalMap* gm = mMapWindow->getGlobalMapRender();
+        const int w = gm->getWidth(), h = gm->getHeight();
+        if (w <= 0 || h <= 0)
+            return;
+        // fit: against the top of the screen and never over the mortar icon and hotbar below; or the user's scale
+        const MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+        const int limit = (mTrackIcon ? mTrackIcon->getTop() : view.height) - 6;
+        mWorldScale = 1.f;
+        if (mWorldUserScale > 0.f)
+            mWorldScale = mWorldUserScale;
+        else if (h + 2 * sWorldPad + 22 > limit)
+            mWorldScale = std::max(0.25f, static_cast<float>(limit - 2 * sWorldPad - 22) / static_cast<float>(h));
+        const int iw = static_cast<int>(w * mWorldScale), ih = static_cast<int>(h * mWorldScale);
+        const int W = std::max(iw, 420) + 2 * sWorldPad, Hh = ih + 2 * sWorldPad + 22;
+        mWorldStatus->setCoord(sWorldPad, sWorldPad, W - 2 * sWorldPad - 140, 20);
+        mWorldPick->setCoord(W - sWorldPad - 56 - 6 - 56, sWorldPad, 56, 20);
+        mWorldClose->setCoord(W - sWorldPad - 56, sWorldPad, 56, 20);
+        mWorldImage->setCoord((W - iw) / 2, sWorldPad + 22, iw, ih);
+        mWorldGrip->setCoord(W - 14, Hh - 14, 14, 14);
+        int left = mWorldMoved ? mWorldPos.left : (view.width - W) / 2;
+        int top = mWorldMoved ? mWorldPos.top : 0;
+        left = std::max(0, std::min(left, view.width - 60));
+        top = std::max(0, std::min(top, view.height - 40));
+        mWorldMap->setCoord(left, top, W, Hh);
+    }
+
+    void Ingredients::onFramePressed(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        if (sender != mPicker && sender != mWorldMap)
+            sender = sender->getParent();   // a title bar: move the frame it sits in
+        mDragOffset = sender->getPosition() - MyGUI::IntPoint(left, top);
+    }
+
+    void Ingredients::onFrameDragged(MyGUI::Widget* sender, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        if (sender != mPicker && sender != mWorldMap)
+            sender = sender->getParent();
+        const MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+        MyGUI::IntPoint pos = MyGUI::IntPoint(left, top) + mDragOffset;
+        pos.left = std::max(0, std::min(pos.left, view.width - 60));
+        pos.top = std::max(0, std::min(pos.top, view.height - 40));
+        sender->setPosition(pos);
+        if (sender == mPicker)
+        {
+            mPickerMoved = true;
+            mPickerPos = pos;
+            Settings::Manager::setInt("picker x", "Ingredients", pos.left);
+            Settings::Manager::setInt("picker y", "Ingredients", pos.top);
+        }
+        else if (sender == mWorldMap)
+        {
+            mWorldMoved = true;
+            mWorldPos = pos;
+            Settings::Manager::setInt("world map x", "Ingredients", pos.left);
+            Settings::Manager::setInt("world map y", "Ingredients", pos.top);
+        }
+    }
+
+    void Ingredients::onGripPressed(MyGUI::Widget* /*sender*/, int /*left*/, int /*top*/, MyGUI::MouseButton /*id*/)
+    {
+    }
+
+    void Ingredients::onGripDragged(MyGUI::Widget* /*sender*/, int left, int /*top*/, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left || !mMapWindow || !mMapWindow->getGlobalMapRender())
+            return;
+        // the map's right edge follows the mouse: that width over the texture's is the new scale
+        const int w = mMapWindow->getGlobalMapRender()->getWidth();
+        const int wanted = left - (mWorldMap->getLeft() + sWorldPad);
+        if (w <= 0 || wanted < 40)
+            return;
+        const float scale = std::max(0.3f, std::min(1.6f, static_cast<float>(wanted) / static_cast<float>(w)));
+        if (std::abs(scale - mWorldScale) < 0.01f)
+            return;
+        mWorldUserScale = scale;
+        Settings::Manager::setFloat("world map scale", "Ingredients", scale);
+        layoutWorldMap();
+        rebuildWorldCells();
+    }
+
+    // the big map's arrow: at the player's spot in their cell, turned to the yaw like the grid's compass
+    void Ingredients::updateWorldArrow()
+    {
+        if (!mWorldArrow || !mMapWindow || !mMapWindow->getGlobalMapRender())
+            return;
+        MWWorld::Ptr player = MWMechanics::getPlayer();
+        if (player.isEmpty() || !player.isInCell() || !player.getCell()->isExterior())
+        {
+            mWorldArrow->setVisible(false);
+            return;
+        }
+        MWRender::GlobalMap* gm = mMapWindow->getGlobalMapRender();
+        const ESM::Position& pp = player.getRefData().getPosition();
+        const float units = static_cast<float>(Constants::CellSizeInUnits);
+        const float fx = (pp.pos[0] - std::floor(pp.pos[0] / units) * units) / units;
+        const float fy = (pp.pos[1] - std::floor(pp.pos[1] / units) * units) / units;
+        float ix = 0.f, iy = 0.f;
+        gm->cellTopLeftCornerToImageSpace(player.getCell()->getCell()->getGridX(), player.getCell()->getCell()->getGridY(), ix, iy);
+        const float cs = gm->getCellSize() * mWorldScale;
+        const int px = mWorldImage->getLeft() + static_cast<int>(ix * mWorldImage->getWidth() + fx * cs);
+        const int py = mWorldImage->getTop() + static_cast<int>(iy * mWorldImage->getHeight() + (1.f - fy) * cs);
+        mWorldArrow->setVisible(true);
+        mWorldArrow->setPosition(px - sArrowBox / 2, py - sArrowBox / 2);
+        MyGUI::ISubWidget* main = mWorldArrow->getSubWidgetMain();
+        MyGUI::RotatingSkin* rot = main ? main->castType<MyGUI::RotatingSkin>(false) : nullptr;
+        if (rot)
+        {
+            rot->setCenter(MyGUI::IntPoint(sArrowBox / 2, sArrowBox / 2));
+            rot->setAngle(pp.rot[2]);
+        }
+    }
+
+    // every interior with a find is credited to the exterior cell its way out opens onto: its own door out,
+    // or the first one reached through the interiors it connects to (a cave's lower level exits through the
+    // upper one). Interiors with no way out at all are left off the map.
+    void Ingredients::creditInteriors()
+    {
+        for (const auto& entry : mWorldInteriors)
+        {
+            const InteriorFind& f = entry.second;
+            int total = 0;
+            for (int n : f.raw) total += n;
+            if (total <= 0)
+                continue;
+            std::vector<std::string> frontier(1, entry.first);
+            std::set<std::string> seen(frontier.begin(), frontier.end());
+            bool credited = false;
+            for (int depth = 0; depth < 8 && !frontier.empty() && !credited; ++depth)
+            {
+                std::vector<std::string> next;
+                for (const std::string& name : frontier)
+                {
+                    std::map<std::string, InteriorFind>::const_iterator it = mWorldInteriors.find(name);
+                    if (it == mWorldInteriors.end())
+                        continue;
+                    if (!it->second.exitsExterior.empty())
+                    {
+                        mWorldInside[it->second.exitsExterior.front()].emplace_back(f.name, f.raw);
+                        credited = true;
+                        break;
+                    }
+                    for (const std::string& n : it->second.exitsInterior)
+                        if (seen.insert(n).second) next.push_back(n);
+                }
+                frontier.swap(next);
+            }
+        }
+        // fold them into the map's totals
+        for (const auto& c : mWorldInside)
+        {
+            int n = 0;
+            for (const auto& place : c.second)
+                for (int v : place.second) n += v;
+            if (n > 0)
+                mWorldCounts[c.first] += n;
+        }
+    }
+
+    // "Saltrice (20): shop (keeper)" for every tracked shop one of these doors leads into
+    std::vector<std::string> Ingredients::shopLinesForDoors(const std::vector<std::string>& dests)
+    {
+        std::vector<std::string> lines;
+        for (const std::string& dest : dests)
+            for (size_t i = 0; i < mTable.size(); ++i)
+            {
+                if (i < mTracked.size() && !mTracked[i])
+                    continue;
+                for (const IngredientSeller& s : mTable[i].sellers)
+                {
+                    if (Misc::StringUtils::lowerCase(s.cell) != dest)
+                        continue;
+                    const size_t comma = s.cell.find(", ");
+                    const int stock = keeperStock(s.npc, mTable[i].ids);
+                    const std::string line = mTable[i].name + (stock > 0 ? " (" + std::to_string(stock) + ")" : "") + ": "
+                        + (comma == std::string::npos ? s.cell : s.cell.substr(comma + 2)) + " (" + s.npc + ")";
+                    if (std::find(lines.begin(), lines.end(), line) == lines.end())
+                        lines.push_back(line);
+                }
+            }
+        return lines;
+    }
+
+    // every grid cell wears the big map's tooltip: the cell's name over a rule, then what grows there per
+    // ingredient ("7 of 12 standing" where that is known), what the big map found indoors, and the shops
+    void Ingredients::updateGridTips()
+    {
+        std::string audit;
+        for (int slot = 0; slot < 25; ++slot)
+        {
+            const GridInfo& info = mGridInfo[slot];
+            std::string title, body;
+            if (!info.known)
+            {
+                title = "Not read yet";
+                body = gridSlotShown(slot) ? "This cell's numbers arrive in a moment" : "";
+            }
+            else
+            {
+                title = info.exterior ? worldCellName(info.x, info.y) : mCellName;
+                for (size_t i = 0; i < mTable.size(); ++i)
+                {
+                    const int placed = i < info.placed.size() ? info.placed[i] : 0;
+                    const int standing = i < info.standing.size() ? info.standing[i] : 0;
+                    if (placed <= 0 && !(info.live && standing > 0))
+                        continue;
+                    body += (body.empty() ? "" : "\n") + mTable[i].name + ": "
+                          + (info.live ? std::to_string(standing) + " of " + std::to_string(placed) + " standing" : std::to_string(placed));
+                }
+                if (info.exterior)
+                {
+                    std::map<std::pair<int, int>, std::vector<std::pair<std::string, std::vector<int>>>>::const_iterator ins = mWorldInside.find(std::make_pair(info.x, info.y));
+                    if (ins != mWorldInside.end())
+                        for (const auto& place : ins->second)
+                            for (size_t i = 0; i < place.second.size() && i < mTable.size(); ++i)
+                                if (place.second[i] > 0)
+                                    body += (body.empty() ? "" : "\n") + mTable[i].name + ": " + std::to_string(place.second[i]) + " in " + place.first;
+                }
+                for (const std::string& line : info.shops)
+                    body += (body.empty() ? "" : "\n") + line;
+                if (body.empty())
+                    body = "nothing tracked here";
+            }
+            // the audit trail, cell by cell and ingredient by ingredient (the nine loaded cells only)
+            if (info.known && !info.standing.empty())
+                for (size_t i = 0; i < mTable.size(); ++i)
+                {
+                    const int placed = i < info.placed.size() ? info.placed[i] : 0;
+                    const int standing = i < info.standing.size() ? info.standing[i] : 0;
+                    if (placed > 0 || standing > 0)
+                        audit += (audit.empty() ? "" : "; ") + title + " " + mTable[i].name + " " + std::to_string(standing) + "/" + std::to_string(placed);
+                }
+            if (title != mGridTipTitle[slot]) { mGridTipTitle[slot] = title; mGridBg[slot]->setUserString("Caption_CellTitle", title); }
+            if (body != mGridTipBody[slot]) { mGridTipBody[slot] = body; mGridBg[slot]->setUserString("Caption_CellBody", body); }
+        }
+        if (audit != mGridAudit && !audit.empty())
+        {
+            mGridAudit = audit;
+            mwmp::SessionLog::get().note("PLANT", "standing/placed  " + audit);
+        }
+    }
+
+    int Ingredients::insideTotal(int x, int y) const
+    {
+        std::map<std::pair<int, int>, std::vector<std::pair<std::string, std::vector<int>>>>::const_iterator it = mWorldInside.find(std::make_pair(x, y));
+        if (it == mWorldInside.end())
+            return 0;
+        int n = 0;
+        for (const auto& place : it->second)
+            for (size_t i = 0; i < place.second.size() && i < mTracked.size(); ++i)
+                if (mTracked[i]) n += place.second[i];
+        return n;
+    }
+
+    void Ingredients::worldScanStep()
+    {
+        MWBase::World* world = MWBase::Environment::get().getWorld();
+        const MWWorld::ESMStore& store = world->getStore();
+        const std::vector<IngredientDef>& table = mTable;
+        // one object id -> how many tracked rows it feeds (a loose tracked ingredient, or an organic
+        // container whose contents yield one)
+        auto countId = [&](const std::string& id) {
+            int n = 0;
+            for (const IngredientDef& def : table)
+                for (const std::string& want : def.ids)
+                    if (Misc::StringUtils::ciEqual(id, want)) { ++n; break; }
+            if (n > 0)
+                return n;
+            const ESM::Container* rec = store.get<ESM::Container>().search(id);
+            if (rec && (rec->mFlags & ESM::Container::Organic))
+                for (const IngredientDef& def : table)
+                    if (listHas(rec->mInventory, def.ids))
+                        ++n;
+            return n;
+        };
+        // the interiors of every tracked shop: a door into one puts a coin on the cell
+        std::vector<std::string> shopCells;
+        for (const IngredientDef& def : table)
+            for (const IngredientSeller& s : def.sellers)
+                shopCells.push_back(Misc::StringUtils::lowerCase(s.cell));
+        int done = 0;
+        while (mWorldNext < mWorldQueue.size() && done < sWorldCellsPerFrame)
+        {
+            const std::pair<int, int> xy = mWorldQueue[mWorldNext++];
+            ++done;
+            // getExterior reads the cell's references in (no rendering, nothing activated) if it was not yet
+            MWWorld::CellStore* cs = world->getExterior(xy.first, xy.second);
+            if (!cs)
+                continue;
+            int n = 0;
+            std::vector<int> perRow(table.size(), 0);
+            if (cs->getState() == MWWorld::CellStore::State_Loaded)
+            {
+                CellScan v(table);
+                v.shopCells = &shopCells;
+                cs->forEachType<ESM::Ingredient>(v);
+                cs->forEachType<ESM::Container>(v);
+                cs->forEachType<ESM::Door>(v);
+                for (size_t i = 0; i < table.size(); ++i) n += v.raw[i];
+                perRow = v.raw;
+                for (const std::string& dest : v.doorShops)
+                    for (const IngredientDef& def : table)
+                        for (const IngredientSeller& s : def.sellers)
+                        {
+                            if (Misc::StringUtils::lowerCase(s.cell) != dest)
+                                continue;
+                            const size_t comma = s.cell.find(", ");
+                            const int stock = keeperStock(s.npc, def.ids);
+                            const std::string line = def.name + (stock > 0 ? " (" + std::to_string(stock) + ")" : "") + ": "
+                                + (comma == std::string::npos ? s.cell : s.cell.substr(comma + 2)) + " (" + s.npc + ")";
+                            std::vector<std::string>& lines = mWorldShops[xy];
+                            if (std::find(lines.begin(), lines.end(), line) == lines.end())
+                                lines.push_back(line);
+                        }
+            }
+            else
+            {
+                cs->preload();
+                if (cs->getState() == MWWorld::CellStore::State_Preloaded)
+                    for (const std::string& id : cs->getPreloadedIds())
+                        n += countId(id);
+            }
+            if (n > 0)
+            {
+                mWorldCounts[xy] = n;
+                mWorldBreakdown[xy] = perRow;
+            }
+        }
+        // then the insides, fewer per frame (a cave holds more than a stretch of coast)
+        int doneInside = 0;
+        while (mWorldNext >= mWorldQueue.size() && mWorldInteriorNext < mWorldInteriorQueue.size() && doneInside < sWorldInteriorsPerFrame)
+        {
+            const std::string& name = mWorldInteriorQueue[mWorldInteriorNext++];
+            ++doneInside;
+            MWWorld::CellStore* cs = nullptr;
+            try { cs = world->getInterior(name); } catch (...) { cs = nullptr; }
+            if (!cs || cs->getState() != MWWorld::CellStore::State_Loaded)
+                continue;
+            CellScan v(table);
+            v.inside = true;
+            cs->forEachType<ESM::Ingredient>(v);
+            cs->forEachType<ESM::Container>(v);
+            cs->forEachType<ESM::Door>(v);
+            InteriorFind& f = mWorldInteriors[Misc::StringUtils::lowerCase(name)];
+            f.name = name;
+            f.raw = v.raw;
+            f.exitsInterior = v.exitsInterior;
+            f.exitsExterior = v.exitsExterior;
+        }
+        if (mWorldNext >= mWorldQueue.size() && mWorldInteriorNext >= mWorldInteriorQueue.size() && mWorldScanning)
+        {
+            creditInteriors();
+            mWorldScanning = false;
+        }
+        if (mWorldMap->getVisible() && (!mWorldScanning || ((mWorldNext + mWorldInteriorNext) % (sWorldCellsPerFrame * 5)) == 0))
+            rebuildWorldCells();
+    }
+
+    void Ingredients::rebuildWorldCells()
+    {
+        MyGUI::Gui& gui = MyGUI::Gui::getInstance();
+        for (MyGUI::Widget* w : mWorldCells)
+            gui.destroyWidget(w);
+        mWorldCells.clear();
+        mWorldArrow = nullptr;
+        if (!mMapWindow || !mMapWindow->getGlobalMapRender())
+            return;
+        MWRender::GlobalMap* gm = mMapWindow->getGlobalMapRender();
+        const int w = mWorldImage->getWidth(), h = mWorldImage->getHeight();
+        const int cs = std::max(6, static_cast<int>(gm->getCellSize() * mWorldScale));
+        const int ox = mWorldImage->getLeft(), oy = mWorldImage->getTop();
+        auto cellBox = [&](int x, int y) {
+            float ix = 0.f, iy = 0.f;
+            gm->cellTopLeftCornerToImageSpace(x, y, ix, iy);
+            return MyGUI::IntCoord(ox + static_cast<int>(ix * w), oy + static_cast<int>(iy * h), cs, cs);
+        };
+        // a faint dark square, a pixel in from each counted cell's edge, so the cell grid reads under everything
+        for (const auto& c : mWorldCounts)
+        {
+            const MyGUI::IntCoord box = cellBox(c.first.first, c.first.second);
+            MyGUI::ImageBox* pane = mWorldMap->createWidget<MyGUI::ImageBox>("ImageBox",
+                MyGUI::IntCoord(box.left + 1, box.top + 1, std::max(1, box.width - 2), std::max(1, box.height - 2)), MyGUI::Align::Default);
+            pane->setImageTexture("white");
+            pane->setColour(MyGUI::Colour(0.f, 0.f, 0.f));
+            pane->setAlpha(0.3f);
+            pane->setNeedMouseFocus(false);
+            mWorldCells.push_back(pane);
+        }
+        // a coin on every cell with a door into a tracked shop, under the count when there is one; hovering
+        // it names the shops and their keepers
+        for (const auto& shop : mWorldShops)
+        {
+            MyGUI::ImageBox* coin = mWorldMap->createWidget<MyGUI::ImageBox>("ImageBox", cellBox(shop.first.first, shop.first.second), MyGUI::Align::Default);
+            coin->setImageTexture("icons\\m\\tx_gold_001.dds");
+            coin->setAlpha(0.9f);
+            coin->setNeedMouseFocus(true);
+            std::string body;
+            for (const std::string& line : shop.second) body += (body.empty() ? "" : "\n") + line;
+            coin->setUserString("ToolTipType", "Layout");
+            coin->setUserString("ToolTipLayout", "MajereCellToolTip");
+            coin->setUserString("Caption_CellTitle", worldCellName(shop.first.first, shop.first.second));
+            coin->setUserString("Caption_CellBody", body);
+            mWorldCells.push_back(coin);
+        }
+        // the player: the map arrow, over the coins and under the counts, placed and turned every frame
+        mWorldArrow = mWorldMap->createWidget<MyGUI::ImageBox>("RotatingSkin", MyGUI::IntCoord(0, 0, sArrowBox, sArrowBox), MyGUI::Align::Default);
+        mWorldArrow->setImageTexture("textures\\majere_maparrow.png");
+        mWorldArrow->setAlpha(0.95f);
+        mWorldArrow->setNeedMouseFocus(false);
+        mWorldCells.push_back(mWorldArrow);
+        updateWorldArrow();
+        int total = 0, most = 1;
+        for (const auto& c : mWorldCounts)
+            most = std::max(most, c.second);
+        // the tenth-highest count (white from there up) and the highest below it (the red end of the rest)
+        std::vector<int> sorted;
+        for (const auto& c : mWorldCounts) sorted.push_back(c.second);
+        std::sort(sorted.begin(), sorted.end(), std::greater<int>());
+        const int tenth = sorted.size() >= 10 ? sorted[9] : (sorted.empty() ? 1 : sorted.back());
+        int rest = 1;
+        for (int n : sorted) if (n < tenth) { rest = n; break; }
+        for (const auto& c : mWorldCounts)
+        {
+            const MyGUI::IntCoord box = cellBox(c.first.first, c.first.second);
+            // the count in a colour: the ten richest cells white, the rest red / orange / yellow / green by their
+            // share of the richest non-white cell
+            MyGUI::Colour tone;
+            if (c.second >= tenth)
+                tone = MyGUI::Colour(1.f, 1.f, 1.f);
+            else
+            {
+                const float share = static_cast<float>(c.second) / static_cast<float>(std::max(1, rest));
+                tone = share >= 0.6f ? MyGUI::Colour(1.f, 0.2f, 0.2f)
+                     : share >= 0.35f ? MyGUI::Colour(1.f, 0.6f, 0.15f)
+                     : share >= 0.15f ? MyGUI::Colour(1.f, 0.95f, 0.3f)
+                     : MyGUI::Colour(0.45f, 0.9f, 0.35f);
+            }
+            MyGUI::TextBox* label = mWorldMap->createWidget<MyGUI::TextBox>("SandBrightText", box, MyGUI::Align::Default);
+            label->setCaption(std::to_string(c.second));
+            label->setTextColour(tone);
+            label->setTextAlign(MyGUI::Align::Center);
+            label->setTextShadow(true);
+            // hover: the cell's name, what grows there per ingredient, and its shops (the number sits over the coin)
+            std::string body;
+            std::map<std::pair<int, int>, std::vector<int>>::const_iterator rows = mWorldBreakdown.find(c.first);
+            if (rows != mWorldBreakdown.end())
+                for (size_t i = 0; i < rows->second.size() && i < mTable.size(); ++i)
+                    if (rows->second[i] > 0)
+                        body += (body.empty() ? "" : "\n") + mTable[i].name + ": " + std::to_string(rows->second[i]);
+            std::map<std::pair<int, int>, std::vector<std::pair<std::string, std::vector<int>>>>::const_iterator ins = mWorldInside.find(c.first);
+            if (ins != mWorldInside.end())
+                for (const auto& place : ins->second)
+                    for (size_t i = 0; i < place.second.size() && i < mTable.size(); ++i)
+                        if (place.second[i] > 0)
+                            body += (body.empty() ? "" : "\n") + mTable[i].name + ": " + std::to_string(place.second[i]) + " in " + place.first;
+            std::map<std::pair<int, int>, std::vector<std::string>>::const_iterator shop = mWorldShops.find(c.first);
+            if (shop != mWorldShops.end())
+                for (const std::string& line : shop->second)
+                    body += (body.empty() ? "" : "\n") + line;
+            label->setNeedMouseFocus(true);
+            label->setUserString("ToolTipType", "Layout");
+            label->setUserString("ToolTipLayout", "MajereCellToolTip");
+            label->setUserString("Caption_CellTitle", worldCellName(c.first.first, c.first.second));
+            label->setUserString("Caption_CellBody", body);
+            mWorldCells.push_back(label);
+            total += c.second;
+        }
+        std::string names;
+        for (const IngredientDef& def : mTable) names += (names.empty() ? "" : ", ") + def.name;
+        mWorldStatus->setCaption(names + (mWorldScanning ? "   (reading...)" : ""));
+        (void)total;
+    }
+
     // ---------------------------------------------------------------- the other icons
 
     void Ingredients::onShopsClicked(MyGUI::Widget* /*sender*/)
@@ -896,20 +1836,76 @@ namespace MWGui
         mLastShopsText.clear();
     }
 
+    void Ingredients::onIconRowClicked(MyGUI::Widget* /*sender*/)
+    {
+        if (!MWBase::Environment::get().getWindowManager()->isGuiMode())
+            return;
+        onTrackClicked(nullptr);   // a tracked icon opens the picker, like the mortar
+    }
+
     void Ingredients::onRawClicked(MyGUI::Widget* /*sender*/)
     {
         if (!MWBase::Environment::get().getWindowManager()->isGuiMode())
             return;
-        mShowRaw = true;    // icon -> map
+        mShowRaw = true;    // icon -> map (3x3 first)
         Settings::Manager::setBool("show raw", "Ingredients", mShowRaw);
+        mGridBig = false;
+        Settings::Manager::setBool("grid big", "Ingredients", mGridBig);
+        layoutGrid();
     }
 
     void Ingredients::onGridClicked(MyGUI::Widget* /*sender*/)
     {
         if (!MWBase::Environment::get().getWindowManager()->isGuiMode())
             return;
-        mShowRaw = false;   // map -> icon
-        Settings::Manager::setBool("show raw", "Ingredients", mShowRaw);
+        if (!mGridBig)
+            mGridBig = true;        // 3x3 -> 5x5
+        else
+        {
+            mGridBig = false;       // 5x5 -> folded icon (the next unfold starts at 3x3 again)
+            mShowRaw = false;
+            Settings::Manager::setBool("show raw", "Ingredients", mShowRaw);
+        }
+        Settings::Manager::setBool("grid big", "Ingredients", mGridBig);
+        layoutGrid();
+        mScanTimer = sScanInterval;   // the outer ring's numbers at once
+    }
+
+    int Ingredients::gridPixels() const
+    {
+        const int n = mGridBig ? 5 : 3;
+        return n * sCell + (n - 1) * sCellGap;
+    }
+
+    bool Ingredients::gridSlotShown(int slot) const
+    {
+        if (mGridBig)
+            return true;
+        const int r = slot / 5, c = slot % 5;
+        return r >= 1 && r <= 3 && c >= 1 && c <= 3;
+    }
+
+    // cells, counts and coins for the view in force: all 25, or the inner nine packed together
+    void Ingredients::layoutGrid()
+    {
+        const int shift = mGridBig ? 0 : 1;
+        for (int i = 0; i < 25; ++i)
+        {
+            const bool shown = gridSlotShown(i);
+            const int cx = (i % 5 - shift) * (sCell + sCellGap), cy = (i / 5 - shift) * (sCell + sCellGap);
+            mGridBg[i]->setVisible(shown);
+            if (mGridText[i]) mGridText[i]->setVisible(shown);
+            if (mGridCoin[i] && !shown) mGridCoin[i]->setVisible(false);
+            if (!shown)
+                continue;
+            mGridBg[i]->setCoord(cx, cy, sCell, sCell);
+            if (mGridText[i]) mGridText[i]->setCoord(cx, cy, sCell, sCell);
+            if (mGridCoin[i]) mGridCoin[i]->setCoord(cx + sCell - sCoin - 1, cy + 1, sCoin, sCoin);
+        }
+        const int side = gridPixels();
+        mGrid->setSize(side, side);
+        if (mMapButton)
+            mMapButton->setSize(side, mMapButton->getHeight());
     }
 
     // ---------------------------------------------------------------- the scan
@@ -919,6 +1915,7 @@ namespace MWGui
         const std::vector<IngredientDef>& table = mTable;
         for (Found& f : mFound) { f.shops.clear(); f.sellersHere.clear(); f.raw = 0; }
         mAnyShops = mAnyRaw = false;
+        mRingPending = false;
         mCellName.clear();
         MWWorld::Ptr player = MWMechanics::getPlayer();
         if (player.isEmpty() || !player.isInCell())
@@ -934,15 +1931,8 @@ namespace MWGui
             {
                 if (!mTracked[i])
                     break;
-                const bool here = Misc::StringUtils::ciEqual(s.cell, mCellName);
-                const bool inTown = cell->isExterior()
-                    && s.cell.size() > mCellName.size() + 2
-                    && Misc::StringUtils::ciEqual(s.cell.substr(0, mCellName.size()), mCellName)
-                    && s.cell.compare(mCellName.size(), 2, ", ") == 0;
-                if (here)
-                    mFound[i].shops.push_back(s.npc + " (this shop)");
-                else if (inTown)
-                    mFound[i].shops.push_back(s.cell.substr(mCellName.size() + 2) + " (" + s.npc + ")");
+                if (Misc::StringUtils::ciEqual(s.cell, mCellName))
+                    mFound[i].shops.emplace_back(keeperStock(s.npc, table[i].ids), s.npc + " (this shop)");
             }
 
         // the interiors of every tracked shop, so a door into one marks its cell on the map
@@ -959,23 +1949,79 @@ namespace MWGui
         cell->forEachType<ESM::Container>(v);
         cell->forEachType<ESM::NPC>(v);
         cell->forEachType<ESM::Door>(v);
+        const std::set<std::string> doorDests(v.doorShops.begin(), v.doorShops.end());   // this cell's doors only
 
         // the 3x3 map: tracked raw placements and shops per cell, north (grid y+1) on the top row, west left
         auto trackedTotal = [&](const CellScan& s) { int n = 0; for (size_t i = 0; i < table.size(); ++i) if (mTracked[i]) n += s.raw[i]; return n; };
         auto trackedSeller = [&](const CellScan& s) { for (size_t i = 0; i < table.size(); ++i) if (mTracked[i] && !s.sellers[i].empty()) return true; return false; };
-        for (int i = 0; i < 9; ++i) { mGridCount[i] = 0; mGridLoaded[i] = false; mGridShop[i] = false; }
-        mGridCount[4] = trackedTotal(v);
-        mGridLoaded[4] = true;
-        mGridShop[4] = v.shopDoor || trackedSeller(v);
+        for (int i = 0; i < 25; ++i) { mGridCount[i] = 0; mGridLoaded[i] = false; mGridShop[i] = false; mGridInfo[i] = GridInfo(); }
+        {
+            GridInfo& own = mGridInfo[12];
+            own.known = true;
+            own.exterior = cell->isExterior();
+            if (own.exterior) { own.x = cell->getCell()->getGridX(); own.y = cell->getCell()->getGridY(); }
+            own.placed = v.raw;
+            own.shops = shopLinesForDoors(v.doorShops);
+            if (!own.exterior)
+            {
+                const std::vector<std::string> here = shopLines(mCellName);   // standing in a tracked shop
+                own.shops.insert(own.shops.end(), here.begin(), here.end());
+            }
+        }
+        mGridCount[12] = trackedTotal(v);
+        if (cell->isExterior())
+            mGridCount[12] += insideTotal(cell->getCell()->getGridX(), cell->getCell()->getGridY());
+        mGridLoaded[12] = true;
+        mGridShop[12] = v.shopDoor || trackedSeller(v);
         if (cell->isExterior())
         {
             MWBase::World* world = MWBase::Environment::get().getWorld();
             const int cx = cell->getCell()->getGridX(), cy = cell->getCell()->getGridY();
-            for (int dx = -1; dx <= 1; ++dx)
-                for (int dy = -1; dy <= 1; ++dy)
+            const int reach = mGridBig ? 2 : 1;
+            int ringBudget = 2;     // cells read from the game data per scan: sixteen at once would hitch
+            mRingPending = false;
+            for (int dx = -reach; dx <= reach; ++dx)
+                for (int dy = -reach; dy <= reach; ++dy)
                 {
                     if (!dx && !dy) continue;
-                    const int slot = (1 - dy) * 3 + (dx + 1);   // row 0 = north
+                    const int slot = (2 - dy) * 5 + (dx + 2);   // row 0 = north
+                    if (std::abs(dx) == 2 || std::abs(dy) == 2)
+                    {
+                        // the outer ring: static placements and shop doors only, read once per cell and kept
+                        const std::pair<int, int> xy(cx + dx, cy + dy);
+                        std::map<std::pair<int, int>, RingCell>::const_iterator kept = mRingCache.find(xy);
+                        if (kept == mRingCache.end())
+                        {
+                            if (!world->getStore().get<ESM::Cell>().search(xy.first, xy.second))
+                                continue;   // no such cell (open sea past the map's edge)
+                            if (ringBudget <= 0) { mRingPending = true; continue; }   // shows "-" until its turn
+                            --ringBudget;
+                            MWWorld::CellStore* far = world->getExterior(xy.first, xy.second);
+                            if (!far || far->getState() != MWWorld::CellStore::State_Loaded) continue;
+                            CellScan f(table);
+                            f.shopCells = &shopCells;
+                            far->forEachType<ESM::Ingredient>(f);
+                            far->forEachType<ESM::Container>(f);
+                            far->forEachType<ESM::Door>(f);
+                            RingCell ring;
+                            ring.raw = f.raw;
+                            ring.shopDoor = f.shopDoor;
+                            ring.shops = shopLinesForDoors(f.doorShops);
+                            ring.total = trackedTotal(f);
+                            kept = mRingCache.emplace(xy, ring).first;
+                        }
+                        mGridCount[slot] = kept->second.total + insideTotal(xy.first, xy.second);
+                        mGridLoaded[slot] = true;
+                        mGridShop[slot] = kept->second.shopDoor;
+                        {
+                            GridInfo& info = mGridInfo[slot];
+                            info.known = true;
+                            info.x = xy.first; info.y = xy.second;
+                            info.placed = kept->second.raw;
+                            info.shops = kept->second.shops;
+                        }
+                        continue;
+                    }
                     MWWorld::CellStore* other = world->getExterior(cx + dx, cy + dy);
                     if (!other || other->getState() != MWWorld::CellStore::State_Loaded) continue;
                     CellScan n(table);
@@ -984,10 +2030,35 @@ namespace MWGui
                     other->forEachType<ESM::Container>(n);
                     other->forEachType<ESM::NPC>(n);
                     other->forEachType<ESM::Door>(n);
-                    mGridCount[slot] = trackedTotal(n);
+                    mGridCount[slot] = trackedTotal(n) + insideTotal(cx + dx, cy + dy);
                     mGridLoaded[slot] = true;
                     mGridShop[slot] = n.shopDoor || trackedSeller(n);
+                    {
+                        GridInfo& info = mGridInfo[slot];
+                        info.known = true;
+                        info.x = cx + dx; info.y = cy + dy;
+                        info.placed = n.raw;
+                        info.shops = shopLinesForDoors(n.doorShops);
+                    }
                 }
+        }
+        // shops whose door stands in THIS cell (the block names shops only from the cell that holds them)
+        for (size_t i = 0; i < table.size(); ++i)
+        {
+            if (!mTracked[i])
+                continue;
+            for (const IngredientSeller& s : table[i].sellers)
+            {
+                if (!doorDests.count(Misc::StringUtils::lowerCase(s.cell)))
+                    continue;
+                const size_t comma = s.cell.find(", ");
+                const std::string entry = (comma == std::string::npos ? s.cell : s.cell.substr(comma + 2)) + " (" + s.npc + ")";
+                bool listed = false;
+                for (const std::pair<int, std::string>& e : mFound[i].shops)
+                    if (e.second == entry || e.second == s.npc + " (this shop)") { listed = true; break; }
+                if (!listed)
+                    mFound[i].shops.emplace_back(keeperStock(s.npc, table[i].ids), entry);
+            }
         }
         for (size_t i = 0; i < table.size(); ++i)
         {
@@ -1004,10 +2075,94 @@ namespace MWGui
             mFound[i].sellersHere.erase(std::unique(mFound[i].sellersHere.begin(), mFound[i].sellersHere.end()), mFound[i].sellersHere.end());
             if (!mFound[i].shops.empty() || !mFound[i].sellersHere.empty()) mAnyShops = true;
         }
+        // the tracked plants of the player's cell and its loaded neighbours: the local map's dots, and -- in
+        // dynamic mode -- the inner nine counts of the grid ("what still stands" is only known for loaded cells)
+        {
+            PlantWalk walk(table, mTracked, mwmp::Main::isLocalServer());
+            struct Near { MWWorld::CellStore* store; int slot, x, y; size_t from, to; };
+            std::vector<Near> around;
+            {
+                Near own = { cell, 12, 0, 0, 0, 0 };
+                if (cell->isExterior()) { own.x = cell->getCell()->getGridX(); own.y = cell->getCell()->getGridY(); }
+                around.push_back(own);
+            }
+            if (cell->isExterior())
+            {
+                MWBase::World* world = MWBase::Environment::get().getWorld();
+                const int cx = cell->getCell()->getGridX(), cy = cell->getCell()->getGridY();
+                for (int dx = -1; dx <= 1; ++dx)
+                    for (int dy = -1; dy <= 1; ++dy)
+                        if (dx || dy)
+                            if (MWWorld::CellStore* other = world->getExterior(cx + dx, cy + dy))
+                                if (other->getState() == MWWorld::CellStore::State_Loaded)
+                                {
+                                    Near n = { other, (2 - dy) * 5 + (dx + 2), cx + dx, cy + dy, 0, 0 };
+                                    around.push_back(n);
+                                }
+            }
+            for (Near& n : around)
+            {
+                n.from = walk.hits.size();
+                n.store->forEachType<ESM::Ingredient>(walk);
+                n.store->forEachType<ESM::Container>(walk);
+                n.to = walk.hits.size();
+            }
+            for (int i = 0; i < 25; ++i) mGridLive[i] = false;
+            mHereStanding = mHerePlaced = 0;
+            for (const Near& n : around)
+            {
+                int standing = 0, placed = 0;
+                GridInfo& info = mGridInfo[n.slot];
+                info.standing.assign(table.size(), 0);
+                info.live = mPlantsMode == Plants_Dynamic;
+                for (size_t k = n.from; k < n.to; ++k)
+                {
+                    if (walk.hits[k].standing) { ++standing; if (walk.hits[k].row < info.standing.size()) ++info.standing[walk.hits[k].row]; }
+                    if (walk.hits[k].placed) ++placed;
+                }
+                if (n.slot == 12) { mHereStanding = standing; mHerePlaced = placed; }
+                if (mPlantsMode == Plants_Dynamic)
+                {
+                    // what is left to pick outdoors, plus what the big map found indoors (never live)
+                    mGridCount[n.slot] = standing + (cell->isExterior() ? insideTotal(n.x, n.y) : 0);
+                    mGridLoaded[n.slot] = true;
+                    mGridLive[n.slot] = true;
+                }
+            }
+            std::vector<PlantDot> dots;
+            if (mPlantsMode != Plants_Off)
+                for (const PlantWalk::Hit& h : walk.hits)
+                {
+                    if (mPlantsMode == Plants_Dynamic ? !h.standing : !h.placed)
+                        continue;
+                    PlantDot d;
+                    d.x = h.x; d.y = h.y;
+                    d.colour = h.row < mTableLook.size() ? mTableLook[h.row].colour : mNormalColour;
+                    if (d.colour == mNormalColour)
+                        d.colour = MyGUI::Colour(1.f, 0.9f, 0.55f);   // no effect category: a plain warm gold
+                    dots.push_back(d);
+                }
+            bool same = dots.size() == mDots.size();
+            for (size_t k = 0; same && k < dots.size(); ++k)
+                same = dots[k].x == mDots[k].x && dots[k].y == mDots[k].y && dots[k].colour == mDots[k].colour;
+            if (!same)
+            {
+                mDots.swap(dots);
+                ++mDotsVersion;
+            }
+            // the audit trail: does "standing" follow harvests by other players and cell resets on a real server?
+            const std::string audit = mCellName + ": " + std::to_string(mHereStanding) + " standing, " + std::to_string(mHerePlaced) + " placed by the game data";
+            if (audit != mDotsAudit && (mHereStanding > 0 || mHerePlaced > 0))
+            {
+                mDotsAudit = audit;
+                mwmp::SessionLog::get().note("PLANT", audit);
+            }
+        }
+
         // inside a shop: the player's own cell IS the shop
         if (!cell->isExterior() && mAnyShops)
-            mGridShop[4] = true;
-        for (int i = 0; i < 9; ++i)
+            mGridShop[12] = true;
+        for (int i = 0; i < 25; ++i)
             if (mGridCount[i] > 0) mAnyRaw = true;
     }
 
@@ -1023,30 +2178,57 @@ namespace MWGui
             const Found& f = mFound[i];
             if (f.shops.empty() && f.sellersHere.empty())
                 continue;
-            shops += "\n" + hex(i < mTableLook.size() ? mTableLook[i].colour : mNormalColour) + table[i].name + cNormal + ": ";
-            bool first = true;
-            for (const std::string& s : f.shops) { shops += (first ? "" : ", ") + s; first = false; }
+            const std::string name = hex(i < mTableLook.size() ? mTableLook[i].colour : mNormalColour) + table[i].name;
+            for (const std::pair<int, std::string>& s : f.shops)
+                shops += "\n" + name + (s.first > 0 ? " (" + std::to_string(s.first) + ")" : "") + cNormal + ": " + s.second;
             for (const std::string& s : f.sellersHere)
             {
                 bool listed = false;   // already named as this shop's keeper: "(this shop)" says it all
-                for (const std::string& shop : f.shops)
-                    if (shop.compare(0, s.size(), s) == 0) { listed = true; break; }
+                for (const std::pair<int, std::string>& shop : f.shops)
+                    if (shop.second.compare(0, s.size(), s) == 0) { listed = true; break; }
                 if (listed)
                     continue;
-                shops += (first ? "" : ", ") + s + " (here)";
-                first = false;
+                const int stock = keeperStock(s, table[i].ids);
+                shops += "\n" + name + (stock > 0 ? " (" + std::to_string(stock) + ")" : "") + cNormal + ": " + s + " (here)";
             }
         }
+        if (shops.size() == cHeader.size() + 5 + cNormal.size())
+            shops += ": none";
         mShopsText = shops;
 
         if (mShopsText != mLastShopsText) { mLastShopsText = mShopsText; mInfo->setCaption(mShopsText); }
-        for (int i = 0; i < 9; ++i)
+        for (size_t i = 0; i < 3; ++i)
+        {
+            if (!mGridQty[i]) continue;
+            const int n = i < mTable.size() ? inventoryCount(mTable[i]) : 0;
+            const std::string cap = n > 0 ? std::to_string(n) : std::string("");
+            if (mGridQty[i]->getCaption() != cap)
+                mGridQty[i]->setCaption(cap);
+        }
+        {
+            std::string tip = "Tracked ingredients in the cells around you, north up; a coin marks a shop\n";
+            if (mPlantsMode == Plants_Dynamic)
+                tip += "Bright numbers: plants still standing (the nine cells around you). Dim: placed by the game data.\n"
+                       "This cell: " + std::to_string(mHereStanding) + " of " + std::to_string(mHerePlaced) + " standing\n";
+            else
+                tip += "Numbers: plants placed by the game data (Plants button on the map: dynamic shows what is left)\n"
+                       "This cell: " + std::to_string(mHerePlaced) + " placed, " + std::to_string(mHereStanding) + " standing\n";
+            tip += "Click: 3x3, then 5x5, then folded";
+            if (tip != mGridTip)
+            {
+                mGridTip = tip;
+                mGrid->setUserString("Caption_Text", tip);
+            }
+        }
+        for (int i = 0; i < 25; ++i)
         {
             const std::string cap = mGridLoaded[i] ? std::to_string(mGridCount[i]) : std::string("-");
             if (mGridText[i]->getCaption() != cap)
                 mGridText[i]->setCaption(cap);
-            mGridText[i]->setTextColour(mGridCount[i] > 0 ? MyGUI::Colour(0.45f, 0.9f, 0.45f) : MyGUI::Colour(0.6f, 0.6f, 0.6f));
-            mGridCoin[i]->setVisible(mGridShop[i]);
+            mGridText[i]->setTextColour(mGridCount[i] <= 0 ? MyGUI::Colour(0.6f, 0.6f, 0.6f)
+                                      : mGridLive[i] ? MyGUI::Colour(0.45f, 0.95f, 0.45f)      // still standing
+                                      : MyGUI::Colour(0.42f, 0.66f, 0.42f));                    // placed by the game data
+            mGridCoin[i]->setVisible(mGridShop[i] && gridSlotShown(i));
         }
     }
 
@@ -1066,27 +2248,73 @@ namespace MWGui
             mScanTimer = 0.f;
             scan();
             updateText();
+            updateGridTips();
+            if (mRingPending)
+                mScanTimer = sScanInterval - 0.1f;   // the 5x5 ring fills in two cells every tenth of a second
         }
-        if (mPicker->getVisible() && !MWBase::Environment::get().getWindowManager()->isGuiMode())
-            mPicker->setVisible(false);
+        {
+            MWBase::WindowManager* wm = MWBase::Environment::get().getWindowManager();
+            const bool gui = wm->isGuiMode();
+            if (!gui && mGuiLast)
+            {
+                // back to the game: hide, and remember what was up
+                if (mPicker->getVisible()) { mPicker->setVisible(false); mPickerReopen = true; }
+                if (mWorldMap->getVisible()) { closeWorldMap(); mWorldReopen = true; }
+            }
+            else if (gui && !mGuiLast && wm->containsMode(MWGui::GM_Inventory))
+            {
+                if (mWorldReopen) openWorldMap();
+                if (mPickerReopen)
+                {
+                    mPicker->setVisible(true);
+                    rebuildPicker();
+                    MyGUI::LayerManager::getInstance().upLayerItem(mPicker);
+                }
+            }
+            else if (!gui && mPicker->getVisible())
+                mPicker->setVisible(false);
+            mGuiLast = gui;
+        }
         mTrackIcon->setVisible(true);
-        mShopsIcon->setVisible(mAnyShops);
-        const bool mapOpen = mAnyRaw && mShowRaw;
-        mRawIcon->setVisible(mAnyRaw && !mapOpen);
+        // the coin and the alchemy icon are always there (the map and the shops block must stay reachable)
+        mShopsIcon->setVisible(true);
+        const bool mapOpen = mShowRaw;
+        mRawIcon->setVisible(!mapOpen);
         mGrid->setVisible(mapOpen);
-        mInfo->setVisible(mAnyShops && mShowShops);
+        mIconRow->setVisible(true);   // the tracked icons show folded or not (each tile hides itself when untracked)
+        mInfo->setVisible(mShowShops);
+        mMapButton->setVisible(mapOpen);
         if (mapOpen)
         {
-            // compass: the player's yaw, driven the way the HUD's own compass is (atan2(sin, cos) = yaw)
+            // the arrow: where the player stands within the middle cell (so the border is visible coming), turned
+            // to the yaw the way the HUD's own compass is (atan2(sin, cos) = yaw)
             MWWorld::Ptr player = MWMechanics::getPlayer();
             MyGUI::ISubWidget* main = mCompass->getSubWidgetMain();
             MyGUI::RotatingSkin* rot = main ? main->castType<MyGUI::RotatingSkin>(false) : nullptr;
             if (rot && !player.isEmpty())
             {
-                rot->setCenter(MyGUI::IntPoint(sCell / 2, sCell / 2));
-                rot->setAngle(player.getRefData().getPosition().rot[2]);
+                const ESM::Position& pp = player.getRefData().getPosition();
+                float fx = 0.5f, fy = 0.5f;
+                if (player.isInCell() && player.getCell()->isExterior())
+                {
+                    const float cs = static_cast<float>(Constants::CellSizeInUnits);
+                    fx = (pp.pos[0] - std::floor(pp.pos[0] / cs) * cs) / cs;
+                    fy = (pp.pos[1] - std::floor(pp.pos[1] / cs) * cs) / cs;
+                }
+                const int centre = (mGridBig ? 2 : 1) * (sCell + sCellGap);
+                const int cx = centre + static_cast<int>(std::lround(fx * (sCell - 1)));
+                const int cy = centre + static_cast<int>(std::lround((1.f - fy) * (sCell - 1)));
+                mCompass->setPosition(cx - sArrowBox / 2, cy - sArrowBox / 2);
+                rot->setCenter(MyGUI::IntPoint(sArrowBox / 2, sArrowBox / 2));
+                rot->setAngle(pp.rot[2]);
             }
         }
+        if (mWorldMap->getVisible() && !MWBase::Environment::get().getWindowManager()->isGuiMode())
+            closeWorldMap();
+        if (mWorldMap->getVisible())
+            updateWorldArrow();
+        if (mWorldScanning)
+            worldScanStep();
         place();
     }
 }

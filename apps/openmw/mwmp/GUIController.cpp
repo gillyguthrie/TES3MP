@@ -37,7 +37,7 @@
 #include "PlayerList.hpp"
 
 
-mwmp::GUIController::GUIController(): mInputBox(0), mListBox(0)
+mwmp::GUIController::GUIController(): mInputBox(0), mListBox(0), mPlayerMarkersShown(true)
 {
     mChat = nullptr;
     keySay = SDL_SCANCODE_Y;
@@ -69,6 +69,10 @@ void mwmp::GUIController::refreshGuiMode(MWGui::GuiMode guiMode)
 void mwmp::GUIController::setupChat()
 {
     assert(mChat == nullptr);
+
+    // majere addition: the settings are loaded by now (the constructor runs before they are), so read the
+    // remembered Players-button state here
+    try { mPlayerMarkersShown = Settings::Manager::getBool("show player markers", "Map"); } catch (...) { mPlayerMarkersShown = true; }
 
     float chatDelay = Settings::Manager::getFloat("delay", "Chat");
     int chatY = Settings::Manager::getInt("y", "Chat");
@@ -348,6 +352,13 @@ ESM::CustomMarker mwmp::GUIController::createMarker(const RakNet::RakNetGUID &gu
     return mEditingMarker;
 }
 
+
+void mwmp::GUIController::setPlayerMarkersShown(bool shown)
+{
+    mPlayerMarkersShown = shown;
+    Settings::Manager::setBool("show player markers", "Map", shown);
+    PlayerList::setMarkersShown(shown);
+}
 
 void mwmp::GUIController::updatePlayersMarkers(MWGui::LocalMapBase *localMapBase)
 {

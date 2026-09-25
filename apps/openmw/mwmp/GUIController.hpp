@@ -59,6 +59,11 @@ namespace mwmp
         void WM_UpdateVisible(MWGui::GuiMode mode);
 
         void updatePlayersMarkers(MWGui::LocalMapBase *localMapBase);
+        // majere addition: other players' map markers can be switched off (the map window's Players button;
+        // [Map] show player markers). Off = no marker is ever created for another player.
+        bool playerMarkersShown() const { return mPlayerMarkersShown; }
+        void setPlayerMarkersShown(bool shown);
+        bool mPlayerMarkersShown;
         void updateGlobalMapMarkerTooltips(MWGui::MapWindow *pWindow);
 
         ESM::CustomMarker createMarker(const RakNet::RakNetGUID &guid);

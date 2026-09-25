@@ -4,8 +4,13 @@
 #include "effectdials.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+
+#include <components/misc/stringops.hpp>
+#include <components/esm/loadspel.hpp>
 
 #include <MyGUI_Button.h>
 #include <MyGUI_EditBox.h>
@@ -14,6 +19,7 @@
 #include <MyGUI_InputManager.h>
 #include <MyGUI_ITexture.h>
 #include <MyGUI_LanguageManager.h>
+#include <MyGUI_LayerManager.h>
 #include <MyGUI_RenderManager.h>
 #include <MyGUI_TextBox.h>
 #include <MyGUI_Widget.h>
@@ -29,6 +35,8 @@
 
 #include "../mwbase/environment.hpp"
 #include "../mwbase/windowmanager.hpp"
+#include "../mwbase/soundmanager.hpp"
+#include "../mwmp/SessionLog.hpp"
 #include "../mwbase/world.hpp"
 
 #include "../mwmechanics/activespells.hpp"
@@ -68,6 +76,15 @@ namespace
     const int sSweepFrames = 72;
     // big dial: white sweep (majere_sweepw_NN) tinted by [EffectDials] sweep colour / sweep alpha;
     // mini line dials: black sweep (majere_sweepk_NN). (majere_sweep_NN, the old baked gold set, is unused now.)
+    // black outline of the same wedge (arc + the two radii), drawn over the tinted fill at its own alpha so the
+    // remaining slice reads against any background; big dials only
+    std::string sweepOutlineTexture(int frame)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "textures\\majere_sweepo_%02d.png", frame);
+        return buf;
+    }
+
     std::string sweepTexture(int frame, bool mini = false)
     {
         char buf[48];
@@ -121,6 +138,8 @@ namespace MWGui
         , mEnabled(true), mDialSize(44), mSpacing(6), mMaxPotions(5), mColumnWidth(150)
         , mRightMargin(12), mTopMargin(12), mShowPotionsWhenEmpty(false), mShowEffectsBox(true)
         , mShowResists(true), mResistTop(-1), mResistBox(nullptr), mResistButton(nullptr), mResistsExpanded(true)
+        , mResistLayout(3), mResistMoved(false), mResistWasInMenu(false), mResistTitle(nullptr)
+        , mResistGrip(nullptr), mResistGapX(0), mResistGapY(0), mResistGripGapX(0), mResistGripGapY(0)
         , mHud(nullptr), mHotbar(nullptr), mResistTooltipTimer(0.f)
         , mShowConstant(true), mPulse(0.f), mStarRow(nullptr), mStarIcon(nullptr), mStarIconSet(false), mStarActive(false), mStarTip(nullptr), mStarTipDirty(true)
     {
@@ -137,6 +156,28 @@ namespace MWGui
         mResistTop            = settingInt("resistances top", -1);
         mShowConstant         = settingBool("show constant effects", true);
         mResistsExpanded      = settingBool("resists expanded", true);
+        mGroupGap             = std::max(0, std::min(80, settingInt("potion block gap", 16)));
+        mPotionWarnSeconds    = std::max(0.f, settingFloat("potion warning seconds", 3.f));
+        mPotionWarnSound      = "repair fail";
+        mPotionWarnRepeats    = std::max(1, std::min(6, settingInt("potion warning repeats", 2)));
+        try { mPotionWarnSound = Settings::Manager::getString("potion warning sound", "EffectDials"); } catch (...) {}
+        {
+            // sources never shown as dials (e.g. a server's week-long "passive" spells: gear bonuses, not timers)
+            std::string list;
+            try { list = Settings::Manager::getString("hide sources", "EffectDials"); } catch (...) {}
+            readNameList(list, mHiddenSources);
+            // potions that are really long buffs sit with the other effects, not in the potion block
+            list.clear();
+            try { list = Settings::Manager::getString("not potions", "EffectDials"); } catch (...) {}
+            readNameList(list, mNotPotions);
+            mLongPotionSeconds = 60.f * std::max(0.f, settingFloat("long potion minutes", 30.f));
+        }
+        mResistLayout         = std::max(1, std::min(4, settingInt("resists layout", 3)));
+        mResistPos            = MyGUI::IntPoint(settingInt("resists x", -1), settingInt("resists y", -1));
+        mResistMoved          = mResistPos.left >= 0 && mResistPos.top >= 0;
+        mResistGapX           = std::max(0, std::min(120, settingInt("resists gap x", 0)));
+        mResistGapY           = std::max(0, std::min(120, settingInt("resists gap y", 0)));
+        for (int i = 0; i < 4; ++i) mResistLayoutButtons[i] = nullptr;
         const float resistScale = std::min(4.f, std::max(1.f, settingFloat("resistances scale", 1.f)));
         sResistRowH    = static_cast<int>(std::lround(22 * resistScale));
         sResistIcon    = static_cast<int>(std::lround(18 * resistScale));
@@ -173,7 +214,8 @@ namespace MWGui
         // The column lives in the Menu layer as its own root so its rows can be hovered for tooltips
         // (a HUD-layer widget is never picked: the HUD's full-screen root wins). Visibility is kept in
         // step with the panel by updateResists / onFrame.
-        mResistBox->detachFromWidget("Menu");
+        // (majere: the Windows layer, not Menu, so the title bar can sit above the game's own windows in a menu)
+        mResistBox->detachFromWidget("Windows");
         mResistBox->setNeedMouseFocus(true);
         mResistBox->eventMouseButtonClick += MyGUI::newDelegate(this, &EffectDials::onResistsClicked);
         for (const auto& ids : resistIds)
@@ -201,6 +243,38 @@ namespace MWGui
             row.value->setNeedMouseFocus(false);
             mResistRows.push_back(row);
         }
+
+        // the title bar (menus only): a dark strip that drags the grid, with the four layout buttons at its right
+        mResistTitle = mResistBox->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(0, 0, 10, 20), MyGUI::Align::Default);
+        mResistTitle->castType<MyGUI::ImageBox>()->setImageTexture("white");
+        mResistTitle->setColour(MyGUI::Colour(0.f, 0.f, 0.f));
+        mResistTitle->setAlpha(0.55f);
+        mResistTitle->setNeedMouseFocus(true);
+        mResistTitle->setUserString("ToolTipType", "Layout");
+        mResistTitle->setUserString("ToolTipLayout", "TextToolTip");
+        mResistTitle->setUserString("Caption_Text", "Drag to move the resistances; 1-4 pick the layout");
+        mResistTitle->eventMouseButtonPressed += MyGUI::newDelegate(this, &EffectDials::onResistTitlePressed);
+        mResistTitle->eventMouseDrag += MyGUI::newDelegate(this, &EffectDials::onResistTitleDragged);
+        for (int i = 0; i < 4; ++i)
+        {
+            MyGUI::Button* b = mResistTitle->createWidget<MyGUI::Button>("MW_Button", MyGUI::IntCoord(0, 1, 18, 18), MyGUI::Align::Default);
+            b->setCaption(std::to_string(i + 1));
+            b->setNeedMouseFocus(true);
+            b->setUserString("Layout", std::to_string(i + 1));
+            b->eventMouseButtonClick += MyGUI::newDelegate(this, &EffectDials::onResistLayoutClicked);
+            mResistLayoutButtons[i] = b;
+        }
+        mResistGrip = mResistTitle->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(3, 3, 14, 14), MyGUI::Align::Default);
+        mResistGrip->castType<MyGUI::ImageBox>()->setImageTexture("white");
+        mResistGrip->setColour(MyGUI::Colour(0.85f, 0.72f, 0.42f));
+        mResistGrip->setAlpha(0.85f);
+        mResistGrip->setNeedMouseFocus(true);
+        mResistGrip->setUserString("ToolTipType", "Layout");
+        mResistGrip->setUserString("ToolTipLayout", "TextToolTip");
+        mResistGrip->setUserString("Caption_Text", "Drag right or left to spread the cells apart or together sideways, down or up for the rows");
+        mResistGrip->eventMouseButtonPressed += MyGUI::newDelegate(this, &EffectDials::onResistGripPressed);
+        mResistGrip->eventMouseDrag += MyGUI::newDelegate(this, &EffectDials::onResistGripDragged);
+        mResistTitle->setVisible(false);
 
         // collapsed form: a "Resists" button in the grid's place (own Menu-layer root, clickable in menus)
         mResistButton = MyGUI::Gui::getInstance().createWidget<MyGUI::Button>("MW_Button",
@@ -239,7 +313,7 @@ namespace MWGui
         mMainWidget->setSize(width, height);
     }
 
-    void EffectDials::setSweep(MyGUI::ImageBox* sweep, int& cachedFrame, float timeLeft, float duration, bool mini)
+    void EffectDials::setSweep(MyGUI::ImageBox* sweep, int& cachedFrame, float timeLeft, float duration, bool mini, MyGUI::ImageBox* outline)
     {
         float elapsed = (duration > 0.f) ? 1.f - (timeLeft / duration) : 0.f;
         elapsed = std::min(1.f, std::max(0.f, elapsed));
@@ -248,6 +322,8 @@ namespace MWGui
             return;
         cachedFrame = frame;
         sweep->setImageTexture(sweepTexture(frame, mini));
+        if (outline)
+            outline->setImageTexture(sweepOutlineTexture(frame));
     }
 
     EffectDials::DialWidgets EffectDials::createDial(Box& box, bool potionStyle)
@@ -277,6 +353,11 @@ namespace MWGui
         w.sweep->setColour(sweepColour());
         w.sweep->setAlpha(std::min(1.f, std::max(0.05f, settingFloat("sweep alpha", 0.45f))));
         w.sweep->setNeedMouseFocus(false);
+        w.outline = w.root->createWidget<MyGUI::ImageBox>("ImageBox",
+            MyGUI::IntCoord(sIconInset, iconTop + sIconInset, s - 2 * sIconInset, s - 2 * sIconInset), MyGUI::Align::Default);
+        w.outline->setImageTexture(sweepOutlineTexture(0));
+        w.outline->setAlpha(std::min(1.f, std::max(0.f, settingFloat("sweep outline alpha", 0.85f))));
+        w.outline->setNeedMouseFocus(false);
 
         if (!potionStyle)
         {
@@ -357,7 +438,7 @@ namespace MWGui
         }
         w.sweep->setVisible(d.timed);
         if (d.timed)
-            setSweep(w.sweep, w.sweepFrame, d.timeLeft, d.duration, false);
+            setSweep(w.sweep, w.sweepFrame, d.timeLeft, d.duration, false, w.outline);
         if (w.seconds)
         {
             w.seconds->setCaption(d.timed ? secondsText(d.timeLeft) : "");
@@ -370,7 +451,16 @@ namespace MWGui
         const int iconTop = titleH;
         w.title->setCoord(0, 0, colW, titleH);
         w.title->setCaption(d.title);
-        w.title->setTextColour((!potionStyle && d.harmful) ? sTextHarmful : sTextNormalBright);
+        // a potion in its last seconds ([EffectDials] potion warning seconds) flashes red: the sweep, the icon's
+        // tint and the title blink together about three times a second
+        const bool ending = d.potion && d.timed && mPotionWarnSeconds > 0.f && d.timeLeft > 0.f && d.timeLeft <= mPotionWarnSeconds;
+        const bool flashOn = ending && std::fmod(mPulse, 0.34f) < 0.17f;
+        static const MyGUI::Colour normalSweep = sweepColour();   // settings do not change while running
+        static const float normalAlpha = std::min(1.f, std::max(0.05f, settingFloat("sweep alpha", 0.45f)));
+        w.sweep->setColour(flashOn ? MyGUI::Colour(1.f, 0.15f, 0.1f) : normalSweep);
+        w.sweep->setAlpha(flashOn ? 0.85f : normalAlpha);
+        w.icon->setColour(flashOn ? MyGUI::Colour(1.f, 0.45f, 0.4f) : MyGUI::Colour::White);
+        w.title->setTextColour(flashOn ? MyGUI::Colour(1.f, 0.3f, 0.25f) : (!potionStyle && d.harmful) ? sTextHarmful : sTextNormalBright);
         if (w.seconds)
             w.seconds->setCoord(iconX, iconTop + s, s, sSecondsH);
         w.icon->setCoord(iconX, iconTop, s, s);
@@ -556,6 +646,16 @@ namespace MWGui
             const ESM::Potion* potionRec = store.get<ESM::Potion>().search(id);
             const bool isPotion = potionRec != nullptr;
 
+            // sources the player asked not to see ([EffectDials] hide sources), matched on how the name begins
+            {
+                const std::string shown = Misc::StringUtils::lowerCase(params.mDisplayName.empty() ? id : params.mDisplayName);
+                bool hidden = false;
+                for (const std::string& h : mHiddenSources)
+                    if (shown.compare(0, h.size(), h) == 0) { hidden = true; break; }
+                if (hidden)
+                    continue;
+            }
+
             // one column per source (potion drunk / spell cast / enchantment used), never merged
             DialData col;
             for (const MWMechanics::ActiveSpells::ActiveEffect& e : params.mEffects)
@@ -575,6 +675,7 @@ namespace MWGui
 
                 if (col.lines.empty())
                 {
+                    col.potion = isPotion;
                     col.icon = isPotion ? wm->correctIconPath(potionRec->mIcon) : sub.icon;   // bottle art / first effect
                     col.title = params.mDisplayName;
                     if (col.title.empty())
@@ -590,17 +691,31 @@ namespace MWGui
             }
             if (col.lines.empty())
                 continue;
-            (isPotion ? potionEntries : effectEntries).push_back({ params.mTimeStamp, col });
+            // a potion that is really a long buff (named in 'not potions', or lasting 'long potion minutes' or
+            // more) sits with the other effects, left of the potion block
+            bool inBlock = isPotion;
+            if (inBlock)
+            {
+                const std::string shown = Misc::StringUtils::lowerCase(col.title);
+                for (const std::string& name : mNotPotions)
+                    if (shown.compare(0, name.size(), name) == 0) { inBlock = false; break; }
+                if (inBlock && mLongPotionSeconds > 0.f && col.duration >= mLongPotionSeconds)
+                    inBlock = false;
+            }
+            col.potion = inBlock;
+            col.key = id + "@" + std::to_string(params.mTimeStamp.getDay()) + ":" + std::to_string(params.mTimeStamp.getHour());
+            (inBlock ? potionEntries : effectEntries).push_back({ params.mTimeStamp, col });
         }
 
-        // one line of columns: potions and spells together, oldest first; potion display cap applies to potions only
+        // one line of columns, two blocks: the potions hold the corner (index 0 = rightmost), every other source
+        // sits to their left; oldest first inside each block; the potion display cap applies to potions only
         std::stable_sort(potionEntries.begin(), potionEntries.end(), [](const Entry& a, const Entry& b) { return a.when < b.when; });
         if (static_cast<int>(potionEntries.size()) > mMaxPotions)
             potionEntries.resize(mMaxPotions);
-        std::vector<Entry> all(potionEntries);
-        all.insert(all.end(), effectEntries.begin(), effectEntries.end());
-        std::stable_sort(all.begin(), all.end(), [](const Entry& a, const Entry& b) { return a.when < b.when; });
-        for (const Entry& e : all)
+        std::stable_sort(effectEntries.begin(), effectEntries.end(), [](const Entry& a, const Entry& b) { return a.when < b.when; });
+        for (const Entry& e : potionEntries)
+            columns.push_back(e.data);
+        for (const Entry& e : effectEntries)
             columns.push_back(e.data);
     }
 
@@ -646,7 +761,12 @@ namespace MWGui
         const int colH = withLines ? (titleH + mDialSize + (tallestLines > 0 ? 2 + tallestLines : 0))
                                    : (titleH + mDialSize + sSecondsH);
 
-        const int contentW = std::max(n * colW + std::max(0, n - 1) * mSpacing, 60);
+        // the potion block ends where the first non-potion column starts (only when both blocks exist)
+        int firstOther = 0;
+        while (firstOther < n && data[firstOther].potion) ++firstOther;
+        const bool twoBlocks = firstOther > 0 && firstOther < n;
+        const int groupGap = twoBlocks ? mGroupGap : 0;
+        const int contentW = std::max(n * colW + std::max(0, n - 1) * mSpacing + groupGap, 60);
         const int boxW = contentW + 2 * sPad;
         const int captionH = withLines ? 0 : sCaptionH + 2;   // potions box has no caption
         const int boxH = sPad + captionH + colH + sPad;
@@ -663,7 +783,8 @@ namespace MWGui
                 w.root->setVisible(false);
                 continue;
             }
-            const int x = sPad + contentW - (static_cast<int>(i) + 1) * colW - static_cast<int>(i) * mSpacing;
+            const int x = sPad + contentW - (static_cast<int>(i) + 1) * colW - static_cast<int>(i) * mSpacing
+                        - ((twoBlocks && static_cast<int>(i) >= firstOther) ? groupGap : 0);
             w.root->setCoord(x, sPad + captionH, colW, colH);
             w.root->setVisible(true);
             applyDial(w, data[i], colW, withLines, titleH, lineHeights[i]);
@@ -686,9 +807,36 @@ namespace MWGui
             box.separators[i]->setVisible(show);
             if (!show)
                 continue;
-            // gap between column i (right) and column i+1 (left)
-            const int gapRight = sPad + contentW - (static_cast<int>(i) + 1) * colW - static_cast<int>(i) * mSpacing;
+            // gap between column i (right) and column i+1 (left); the gap between the two blocks gets the
+            // heavier rule below instead of this thin one
+            const bool blockEdge = twoBlocks && static_cast<int>(i) + 1 == firstOther;
+            if (blockEdge)
+            {
+                box.separators[i]->setVisible(false);
+                continue;
+            }
+            const int gapRight = sPad + contentW - (static_cast<int>(i) + 1) * colW - static_cast<int>(i) * mSpacing
+                               - ((twoBlocks && static_cast<int>(i) >= firstOther) ? groupGap : 0);
             box.separators[i]->setCoord(gapRight - mSpacing / 2 - 1, sPad + captionH + 2, 1, colH - 4);
+        }
+        // the heavier gold rule down the middle of the gap between the potion block and everything else
+        if (withLines && !box.groupRule)
+        {
+            box.groupRule = box.frame->createWidget<MyGUI::ImageBox>("ImageBox", MyGUI::IntCoord(0, 0, 2, 10), MyGUI::Align::Default);
+            box.groupRule->setImageTexture("white");
+            box.groupRule->setColour(sRuleGold);
+            box.groupRule->setAlpha(1.f);
+            box.groupRule->setNeedMouseFocus(false);
+        }
+        if (box.groupRule)
+        {
+            box.groupRule->setVisible(twoBlocks);
+            if (twoBlocks)
+            {
+                // left edge of the last potion column, then half the whole gap to its left
+                const int potionLeft = sPad + contentW - firstOther * colW - (firstOther - 1) * mSpacing;
+                box.groupRule->setCoord(potionLeft - (mSpacing + groupGap) / 2 - 1, sPad + captionH, 2, colH);
+            }
         }
     }
 
@@ -722,10 +870,15 @@ namespace MWGui
 
         std::vector<DialData> columns;
         collect(columns);
+        warnExpiringPotions(columns);
         DialData sun;
         if (collectSunDamage(sun))
-            columns.insert(columns.begin(), sun);   // index 0 = rightmost column: it stays put
-
+        {
+            // the first of the non-potion block (right after the potions), where it stays put
+            size_t at = 0;
+            while (at < columns.size() && columns[at].potion) ++at;
+            columns.insert(columns.begin() + at, sun);
+        }
         // a single box holds every column (the old separate Effects box is no longer used)
         mEffects.frame->setVisible(false);
         const bool show = !columns.empty() || mShowPotionsWhenEmpty;
@@ -770,6 +923,173 @@ namespace MWGui
         Settings::Manager::setBool("resists expanded", "EffectDials", mResistsExpanded);
     }
 
+    EffectDials::~EffectDials()
+    {
+    }
+
+    // A sound when a potion in the block is about to run out, once per drink (and repeated across the window).
+    void EffectDials::warnExpiringPotions(const std::vector<DialData>& columns)
+    {
+        if (mPotionWarnSeconds <= 0.f || mPotionWarnSound.empty())
+            return;
+        const bool armed = true;
+        // the sound plays 'repeats' times spread across the window: with 3 s and 2 repeats, at 3 s and at 1.5 s
+        std::map<std::string, int> still;
+        bool play = false;
+        for (const DialData& col : columns)
+        {
+            if (!col.potion || col.key.empty() || col.timeLeft <= 0.f || col.duration <= mPotionWarnSeconds)
+                continue;
+            std::map<std::string, int>::const_iterator seen = mPotionsWarned.find(col.key);
+            int played = seen == mPotionsWarned.end() ? 0 : seen->second;
+            if (col.timeLeft <= mPotionWarnSeconds)
+            {
+                // which repeat is due: the k-th fires once timeLeft <= seconds * (repeats - k) / repeats
+                int due = 0;
+                while (due < mPotionWarnRepeats && col.timeLeft <= mPotionWarnSeconds * (mPotionWarnRepeats - due) / mPotionWarnRepeats)
+                    ++due;
+                if (due > played)
+                {
+                    // marked whether or not it plays, so arming late does not fire a stale warning
+                    if (armed)
+                        play = true;
+                    played = due;
+                }
+            }
+            if (played > 0)
+                still[col.key] = played;
+        }
+        mPotionsWarned.swap(still);
+        if (play)   // several potions ending together: one sound
+        {
+            MWBase::Sound* played = MWBase::Environment::get().getSoundManager()->playSound(mPotionWarnSound, 1.f, 1.f);
+            mwmp::SessionLog::get().note("POTION", std::string("run-out warning: sound '") + mPotionWarnSound + (played ? "' played" : "' NOT FOUND"));
+        }
+    }
+
+    // "a, b; c" -> lower-case trimmed names
+    void EffectDials::readNameList(const std::string& list, std::vector<std::string>& out)
+    {
+        std::string item;
+        for (size_t k = 0; k <= list.size(); ++k)
+        {
+            if (k == list.size() || list[k] == ',' || list[k] == ';')
+            {
+                while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+                while (!item.empty() && item.back() == ' ') item.pop_back();
+                if (!item.empty())
+                    out.push_back(Misc::StringUtils::lowerCase(item));
+                item.clear();
+            }
+            else
+                item += list[k];
+        }
+    }
+
+    int EffectDials::resistCols() const
+    {
+        static const int cols[4] = { 1, 2, 3, 6 };
+        return cols[std::max(0, std::min(3, mResistLayout - 1))];
+    }
+
+    void EffectDials::onResistLayoutClicked(MyGUI::Widget* sender)
+    {
+        const int n = std::atoi(sender->getUserString("Layout").c_str());
+        if (n < 1 || n > 4)
+            return;
+        mResistLayout = n;
+        Settings::Manager::setInt("resists layout", "EffectDials", n);
+    }
+
+    void EffectDials::onResistTitlePressed(MyGUI::Widget* /*sender*/, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        MyGUI::LayerManager::getInstance().upLayerItem(mResistBox);   // stay above the windows while dragging
+        mResistDragOffset = mResistBox->getPosition() - MyGUI::IntPoint(left, top);
+    }
+
+    void EffectDials::onResistTitleDragged(MyGUI::Widget* /*sender*/, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        const MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+        MyGUI::IntPoint pos = MyGUI::IntPoint(left, top) + mResistDragOffset;
+        pos.left = std::max(0, std::min(pos.left, view.width - 40));
+        pos.top = std::max(0, std::min(pos.top, view.height - 40));
+        mResistMoved = true;
+        mResistPos = pos;
+        Settings::Manager::setInt("resists x", "EffectDials", pos.left);
+        Settings::Manager::setInt("resists y", "EffectDials", pos.top);
+    }
+
+    void EffectDials::onResistGripPressed(MyGUI::Widget* /*sender*/, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        MyGUI::LayerManager::getInstance().upLayerItem(mResistBox);
+        mResistGripStart = MyGUI::IntPoint(left, top);
+        mResistGripGapX = mResistGapX;
+        mResistGripGapY = mResistGapY;
+    }
+
+    void EffectDials::onResistGripDragged(MyGUI::Widget* /*sender*/, int left, int top, MyGUI::MouseButton id)
+    {
+        if (id != MyGUI::MouseButton::Left)
+            return;
+        // one screen pixel of drag = one pixel of gap; the whole grid spreads about its top-left corner
+        mResistGapX = std::max(0, std::min(120, mResistGripGapX + (left - mResistGripStart.left)));
+        mResistGapY = std::max(0, std::min(120, mResistGripGapY + (top - mResistGripStart.top)));
+        Settings::Manager::setInt("resists gap x", "EffectDials", mResistGapX);
+        Settings::Manager::setInt("resists gap y", "EffectDials", mResistGapY);
+    }
+
+    // the six cells for the current layout. Two wide fills down the columns (fire, frost, shock on the left;
+    // magicka, poison, paralysis on the right); the others fill along the rows. The bar's 20 px are always
+    // reserved above the cells (hidden while the game runs) so the cells never jump when a menu opens or closes.
+    void EffectDials::layoutResistRows(bool withTitle)
+    {
+        const int cols = resistCols();
+        const int rows = 6 / cols;
+        const int cellW = sResistIcon + 4 + sResistValueW + mResistGapX;
+        const int rowH = sResistRowH + mResistGapY;
+        const int titleH = 20;
+        // the bar is never narrower than its grip plus the four buttons need, whatever the layout; when it is
+        // wider than the cells (one column), the cells sit at its RIGHT edge so the box can still be pushed
+        // to the screen's right edge -- the bar then hangs to the left of the cells
+        const int cellsW = cols * cellW - mResistGapX;
+        const int w = std::max(cellsW, 20 + 4 * 20 + 30);
+        const int shift = w - cellsW;
+        for (size_t i = 0; i < mResistRows.size(); ++i)
+        {
+            int c, r;
+            if (cols == 2) { c = static_cast<int>(i) / rows; r = static_cast<int>(i) % rows; }
+            else           { c = static_cast<int>(i) % cols; r = static_cast<int>(i) / cols; }
+            mResistRows[i].row->setPosition(shift + c * cellW, titleH + r * rowH);
+        }
+        mResistTitle->setVisible(withTitle);
+        mResistTitle->setCoord(0, 0, w, titleH);
+        for (int i = 0; i < 4; ++i)
+            mResistLayoutButtons[i]->setPosition(w - 4 * 20 + i * 20 - 2, 1);
+    }
+
+    namespace
+    {
+        // majere addition: an elemental shield also resists its own element by its magnitude -- the engine adds
+        // Fire / Lightning / Frost Shield to fire / shock / frost resistance (getEffectResistanceAttribute) --
+        // so the overlay counts it too. -1 for the other resistances.
+        int shieldFor(int resistId)
+        {
+            switch (resistId)
+            {
+                case ESM::MagicEffect::ResistFire:  return ESM::MagicEffect::FireShield;
+                case ESM::MagicEffect::ResistShock: return ESM::MagicEffect::LightningShield;
+                case ESM::MagicEffect::ResistFrost: return ESM::MagicEffect::FrostShield;
+                default: return -1;
+            }
+        }
+    }
+
     void EffectDials::updateResists()
     {
         mResistBox->setVisible(mShowResists && mResistsExpanded);
@@ -798,6 +1118,9 @@ namespace MWGui
             float net = effects.get(MWMechanics::EffectKey(row.resistId)).getMagnitude();
             if (row.weaknessId >= 0)
                 net -= effects.get(MWMechanics::EffectKey(row.weaknessId)).getMagnitude();
+            const int shield = shieldFor(row.resistId);
+            if (shield >= 0)
+                net += effects.get(MWMechanics::EffectKey(shield)).getMagnitude();
             const int v = static_cast<int>(std::lround(net));
             row.value->setCaption((v > 0 ? "+" : "") + std::to_string(v));
             row.value->setTextColour(v > 0 ? sTextGood : (v < 0 ? sTextHarmful : sTextNormalBright));
@@ -819,15 +1142,22 @@ namespace MWGui
             mStarIcon->setAlpha(1.f);
         }
 
-        // star just left of the hotbar strip
+        // star just left of the hotbar (the hotbar works out the placement)
         if (mHotbar)
             mStarRow->setCoord(mHotbar->getStarSlot());
 
-        // resistances: a 3x2 grid (or the collapsed "Resists" button) sitting just above the HUD's active-effect
-        // icons, right edge on that box's right edge; [EffectDials] resistances top overrides the vertical spot
+        // resistances: the grid in its chosen layout (or the collapsed "Resists" button) just above the HUD's
+        // active-effect icons, right edge on that box's right edge; [EffectDials] resistances top overrides the
+        // vertical spot; a dragged grid keeps the spot it was dropped at. In a menu the grid wears its title bar.
+        const bool inMenu = wm->isGuiMode();
+        if (inMenu && !mResistWasInMenu)
+            MyGUI::LayerManager::getInstance().upLayerItem(mResistBox);   // above the windows that just opened
+        mResistWasInMenu = inMenu;
+        layoutResistRows(inMenu);
         const MyGUI::IntSize view = mMainWidget->getSize();
-        const int w = 3 * (sResistIcon + 4 + sResistValueW);
-        const int h = 2 * sResistRowH;
+        const int cols = resistCols();
+        const int w = std::max(cols * (sResistIcon + 4 + sResistValueW + mResistGapX) - mResistGapX, 20 + 4 * 20 + 30);
+        const int h = 20 + (6 / cols) * (sResistRowH + mResistGapY) - mResistGapY;
         int right = view.width - mRightMargin;
         int bottom = view.height - 120;
         if (mHud && mHud->getEffectBox())
@@ -838,8 +1168,18 @@ namespace MWGui
         }
         if (mResistTop >= 0)
             bottom = mResistTop + h;
-        mResistBox->setCoord(right - w, bottom - h, w, h);
-        mResistButton->setCoord(right - mResistButton->getWidth(), bottom - mResistButton->getHeight(), mResistButton->getWidth(), mResistButton->getHeight());
+        if (mResistMoved)
+        {
+            const int left = std::max(0, std::min(mResistPos.left, view.width - w));
+            const int top = std::max(0, std::min(mResistPos.top, view.height - h));
+            mResistBox->setCoord(left, top, w, h);
+            mResistButton->setCoord(left, top, mResistButton->getWidth(), mResistButton->getHeight());
+        }
+        else
+        {
+            mResistBox->setCoord(right - w, bottom - h, w, h);
+            mResistButton->setCoord(right - mResistButton->getWidth(), bottom - mResistButton->getHeight(), mResistButton->getWidth(), mResistButton->getHeight());
+        }
 
         // a few times a second: star visibility + its tooltip; resist tooltips only matter while a menu is open
         if (mResistTooltipTimer >= 0.25f)
@@ -1035,9 +1375,9 @@ namespace MWGui
         // contributing to one resistance and its weakness counterpart.
         struct ResistSources : public MWMechanics::EffectSourceVisitor
         {
-            int resistId, weaknessId;
+            int resistId, weaknessId, shieldId;
             std::vector<std::pair<std::string, float>> resist, weakness;
-            ResistSources(int r, int w) : resistId(r), weaknessId(w) {}
+            ResistSources(int r, int w) : resistId(r), weaknessId(w), shieldId(shieldFor(r)) {}
             void visit(MWMechanics::EffectKey key, int /*effectIndex*/, const std::string& sourceName,
                        const std::string& sourceId, int /*casterActorId*/, float magnitude,
                        float /*remainingTime*/, float /*totalTime*/) override
@@ -1045,6 +1385,8 @@ namespace MWGui
                 const std::string name = sourceName.empty() ? sourceId : sourceName;
                 if (key.mId == resistId)
                     resist.emplace_back(name, magnitude);
+                else if (shieldId >= 0 && key.mId == shieldId)
+                    resist.emplace_back(name + " (shield)", magnitude);
                 else if (weaknessId >= 0 && key.mId == weaknessId)
                     weakness.emplace_back(name, magnitude);
             }

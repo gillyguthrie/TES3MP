@@ -24,6 +24,7 @@ namespace mwmp
         static bool init(std::vector<std::string> &content, Files::Collections &collections);
         static void postInit();
         static bool isInitialized();
+        static bool isLocalServer() { return localServer; }   // majere addition: 127.0.0.1 / localhost / ::1
         static void destroy();
         static const Main &get();
         static void frame(float dt);
@@ -45,6 +46,7 @@ namespace mwmp
         static std::string resourceDir;
         static std::string address;
         static std::string serverPassword;
+        static bool localServer;   // majere addition
         Main (const Main&);
         ///< not implemented
         Main& operator= (const Main&);

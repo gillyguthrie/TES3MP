@@ -40,6 +40,8 @@ namespace mwmp
         static bool isDedicatedPlayer(const MWWorld::Ptr &ptr);
 
         static void enableMarkers(const ESM::Cell& cell);
+        // majere addition: show or drop every other player's map marker (the Players button on the map window)
+        static void setMarkersShown(bool shown);
 
         static void clearHitAttemptActorId(int actorId);
 

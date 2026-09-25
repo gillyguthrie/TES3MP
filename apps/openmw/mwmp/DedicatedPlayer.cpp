@@ -43,6 +43,7 @@ using namespace mwmp;
 DedicatedPlayer::DedicatedPlayer(RakNet::RakNetGUID guid) : BasePlayer(guid)
 {
     reference = 0;
+    markerEnabled = false;   // majere fix: was never set, so a marker could appear with the Players button off
     attack.pressed = false;
     cast.pressed = false;
 
@@ -544,7 +545,8 @@ void DedicatedPlayer::setSpellsActive()
 
 void DedicatedPlayer::updateMarker()
 {
-    if (!markerEnabled)
+    // majere change: nothing is drawn while the map window's Players button is off
+    if (!markerEnabled || !Main::get().getGUIController()->playerMarkersShown())
     {
         return;
     }
@@ -565,6 +567,9 @@ void DedicatedPlayer::updateMarker()
 
 void DedicatedPlayer::enableMarker()
 {
+    // majere change: the map window's Players button off = no marker for anyone, ever
+    if (!Main::get().getGUIController()->playerMarkersShown())
+        return;
     markerEnabled = true;
     updateMarker();
 }

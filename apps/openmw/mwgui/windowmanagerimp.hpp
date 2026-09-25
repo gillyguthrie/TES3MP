@@ -514,6 +514,7 @@ namespace MWGui
     HUD *mHud;
     Hotbar *mHotbar;   // majere addition (hotbar)
     EffectDials *mEffectDials;   // majere addition (effect dials)
+    bool mHideMapInMenu;         // majere addition: [Windows] hide map in menu (the map window is then in no mode's list)
     StatBars *mStatBars;   // majere addition (stat bars)
     Ingredients *mIngredients;   // majere addition (ingredient finder)
     MapWindow *mMap;

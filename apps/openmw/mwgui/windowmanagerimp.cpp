@@ -189,6 +189,7 @@ namespace MWGui
       , mHudEnabled(true)
       , mHotbar(nullptr)   // majere addition (hotbar)
       , mEffectDials(nullptr)   // majere addition (effect dials)
+      , mHideMapInMenu(false)
       , mStatBars(nullptr)   // majere addition (stat bars)
       , mIngredients(nullptr)   // majere addition (ingredient finder)
       , mCursorVisible(true)
@@ -344,6 +345,7 @@ namespace MWGui
         */
         bool hideMapInMenu = false;
         try { hideMapInMenu = Settings::Manager::getBool("hide map in menu", "Windows"); } catch (...) {}
+        mHideMapInMenu = hideMapInMenu;
         if (hideMapInMenu)
             mGuiModeStates[GM_Inventory] = GuiModeState({mInventoryWindow, mSpellWindow, mStatsWindow});
         else
@@ -441,6 +443,7 @@ namespace MWGui
         mEffectDials->setAnchors(mHud, mHotbar);   // majere addition (layout anchors)
         mStatBars = new StatBars(mHotbar);   // majere addition (stat bars); not a WindowBase, deleted in the destructor
         mIngredients = new Ingredients(mHotbar);   // majere addition (ingredient finder); same
+        mIngredients->setMapWindow(mMap);
         mWindows.push_back(mQuickKeysMenu);
         mGuiModeStates[GM_QuickKeysMenu] = GuiModeState(mQuickKeysMenu);
 
@@ -898,6 +901,23 @@ namespace MWGui
                 if (window->isVisible())
                     window->onFrame(frameDuration);
         }
+        /*
+            Start of majere change: with the map window kept out of the inventory menu it sits in no mode's window
+            list, so nothing above drives its per-frame update -- and that update is what hands the local map its
+            cell textures and fog of war (the pinned map stayed black). Drive it here whenever it is showing.
+        */
+        if (mHideMapInMenu && mMap && mMap->isVisible())
+        {
+            bool driven = false;
+            if (!mGuiModes.empty())
+                for (WindowBase* window : mGuiModeStates[mGuiModes.back()].mWindows)
+                    if (window == mMap) driven = true;
+            if (!driven)
+                mMap->onFrame(frameDuration);
+        }
+        /*
+            End of majere change
+        */
 
         /*
             Start of tes3mp addition

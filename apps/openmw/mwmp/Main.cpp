@@ -53,6 +53,7 @@ using namespace mwmp;
 Main *Main::pMain = 0;
 std::string Main::address = "";
 std::string Main::serverPassword = TES3MP_DEFAULT_PASSW;
+bool Main::localServer = false;   // majere addition
 std::string Main::resourceDir = "";
 
 std::string Main::getResDir()
@@ -150,6 +151,7 @@ bool Main::init(std::vector<std::string> &content, Files::Collections &collectio
         pMain->port = atoi(address.substr(delimPos + 1).c_str());
     }
     get().mLocalSystem->serverPassword = serverPassword;
+    localServer = (pMain->server == "127.0.0.1" || pMain->server == "localhost" || pMain->server == "::1");   // majere addition
     SessionLog::get().start(pMain->server, pMain->port);   // majere addition (session log)
 
     pMain->mNetworking->connect(pMain->server, pMain->port, content, collections);

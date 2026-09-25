@@ -4,7 +4,8 @@ Majere's TES3MP client
 This is a personal fork of the TES3MP 0.8.1 client with a set of HUD additions for alchemists and gatherers,
 built on top of the unmodified upstream source below. Everything added is marked with a `majere addition` or
 `majere change` comment in the code, and every new option lives in `files/settings-default.cfg` under its own
-section (`[Hotbar]`, `[EffectDials]`, `[StatBars]`, `[Ingredients]`, `[SessionLog]`).
+section (`[Hotbar]`, `[EffectDials]`, `[StatBars]`, `[Ingredients]`, `[SessionLog]`, with a few map
+options under `[Map]` and `[Windows]`).
 
 **Visual overlay only.** Everything here reads what the game already knows and draws it on your screen. Nothing
 acts in the game world, presses a key for you, or sends anything to a server on your behalf: no packet is
@@ -26,17 +27,31 @@ What is added
 
 * **Hotbar** with drag-and-drop item and spell slots, item and spell tooltips, a page label fed by a server's
   "Quick Key Page: N" message, and a gold flash on use.
-* **Effect strip**: the active effects as small dials with a soft clock sweep, a Sun Damage column that only
-  shows in daylight, and the constant-effect (Azura's Star) indicator with a two-column popup.
-* **Resistances**: a collapsible 3x2 grid of fire, frost, shock, magicka, poison and paralysis.
+* **Effect strip** in the top-right corner: potions drunk hold the corner as a block of their own, every other
+  timed effect sits to their left. Each is a small dial with a clock sweep. A potion's last seconds flash red
+  and play a warning sound. Long buffs delivered as potions sit with the other effects, and named sources can
+  be hidden. A Sun Damage column shows only in daylight, and Azura's Star lights up while constant-effect gear
+  is worn.
+* **Resistances**: fire, frost, shock, magicka, poison and paralysis in one of four layouts, which can be
+  dragged anywhere and spread apart while a menu is open. Fire, lightning and frost shields count toward
+  their element, as they do in the game.
 * **Stat bars** for health, magicka and fatigue beside the hotbar, with +/- signs for anything draining or
-  restoring them per second and tooltips naming the sources.
-* **Ingredient finder**: a mortar-and-pestle icon opens a picker that searches every ingredient record by name
-  or effect, tiled as icons with effect tooltips and a colour code by effect category; up to three are tracked.
-  A coin icon lists the shops in town that restock them and any seller standing nearby; an alchemy icon unfolds
-  into a 3x3 map of the surrounding cells with the count of tracked plants per cell, shop markers and a facing
-  arrow.
+  restoring them per second (vampire sun damage included) and tooltips naming the sources.
+* **Ingredient finder**: a mortar-and-pestle icon opens a picker that searches every ingredient by name or
+  effect, with your carried amounts on each tile. Up to three are tracked, and shown beside the icons with the
+  amount you carry. A shops block names the shops in the cell you stand in that restock them, with each
+  keeper's stock. A cell grid (3x3, or 5x5) counts the tracked plants around you, live for the cells the game
+  has loaded, with shop coins and a facing arrow. A world map counts them for every cell, indoor finds
+  included, coloured by abundance, with shop coins and a tooltip per cell.
+* **Local map**: gold coins on the doors of shops that sell a tracked ingredient, dots for the tracked plants
+  (still standing, every placement, or off), and a button to hide other players' markers.
 * **Session log**: a per-session plain-text log of chat, server messages and the player's vitals (read-only).
+
+The world map reads every cell from your own game data the first time it opens in a session. That takes a
+few seconds and some memory; nothing is sent anywhere.
+
+**Fixed since r1:** the pinned map window stayed black in Local mode and fog of war never cleared. If you use
+r1, update.
 
 Download
 --------
